@@ -87,12 +87,13 @@
   nil)
 
 (defun take-events (ys)
-  "Caller owns the event vector. Pooling must not reuse it."
-  (let ((ev (ys-events ys)))
-    (setf (ys-events ys)
-          (make-array (max 32 (array-dimension ev 0))
-                      :adjustable t :fill-pointer 0))
-    ev))
+  "Copy out a right-sized vector. Keep the reserved buffer on YS for reuse."
+  (let* ((ev (ys-events ys))
+         (n (fill-pointer ev))
+         (out (make-array n)))
+    (replace out ev :end1 n :end2 n)
+    (setf (fill-pointer ev) 0)
+    out))
 
 (declaim (inline ys-buf-clear ys-buf-push ys-buf-take))
 
