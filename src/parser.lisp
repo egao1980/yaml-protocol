@@ -582,7 +582,7 @@
                (let ((col (ys-column ys))
                      (n (ys-peek ys)))
                  (when (or (null n)
-                           (<= col indent)
+                           (< col indent)
                            (c-forbidden-p ys)
                            (c-nb-comment-text-p ys)
                            (and flow (c-flow-indicator-p n))
@@ -1289,7 +1289,7 @@
                                                                    (not flow)))
                           :anchor anchor :tag tag :style :single))
             ((ns-plain-first-p ys flow)
-             (emit-scalar ys (ns-plain ys :flow flow :indent (flow-n)
+             (emit-scalar ys (ns-plain ys :flow flow :indent indent
                                        :single-line (eq key :implicit))
                           :anchor anchor :tag tag :style :plain))
             (t
