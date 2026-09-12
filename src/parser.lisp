@@ -82,12 +82,32 @@
      t)
     (t nil)))
 
+(defun comment-start-p (ys)
+  "A `#` starts a comment only at BOL or after a blank (9JBA)."
+  (and (eql (ys-peek ys) #\#)
+       (or (zerop (ys-pos ys))
+           (let ((prev (char (ys-text ys) (1- (ys-pos ys)))))
+             (or (blank-p prev) (break-p prev))))))
+
 (defun skip-ws-breaks (ys)
-  "Skip spaces, tabs, comments, and line breaks."
+  "Skip spaces, tabs, comments, and line breaks.
+   A tab at column 0 is indentation unless the line is a flow node (6CA3).
+   A tab after spaces on the same line is s-separate-in-line (DK95)."
   (loop
+    (when (and (zerop (ys-column ys))
+               (eql (ys-peek ys) #\Tab))
+      (let ((saved (ys-pos ys)))
+        (skip-blanks ys)
+        (let ((c (ys-peek ys)))
+          (unless (or (null c) (break-p c)
+                      (member c '(#\[ #\] #\{ #\}))
+                      (comment-start-p ys))
+            (setf (ys-pos ys) saved)
+            (fail-parse ys "tab cannot be used as indentation")))
+        (setf (ys-pos ys) saved)))
     (skip-blanks ys)
     (cond
-      ((eql (ys-peek ys) #\#) (skip-comment ys))
+      ((comment-start-p ys) (skip-comment ys))
       ((skip-break ys))
       (t (return)))))
 
@@ -111,6 +131,12 @@
     (ys-next ys))
   (skip-blanks ys)
   (skip-comment ys))
+
+(defun consume-end-marker (ys)
+  "Consume `...`. Trailing tokens on the same line are invalid (3HFZ)."
+  (consume-marker ys "...")
+  (unless (or (ys-eof-p ys) (break-p (ys-peek ys)))
+    (fail-parse ys "invalid content after document end marker")))
 
 (defun fail-parse (ys fmt &rest args)
   (error 'yaml-parse-error
@@ -209,10 +235,11 @@
        (concatenate 'string "!" name)))))
 
 (defun parse-anchor-name (ys)
+  "ns-anchor-char = ns-char minus c-flow-indicator. `:` is allowed (2SXE)."
   (let ((name (with-output-to-string (o)
                 (loop for c = (ys-peek ys)
                       while (and c (not (blank-p c)) (not (break-p c))
-                                 (not (member c '(#\[ #\] #\{ #\} #\, #\:))))
+                                 (not (member c '(#\[ #\] #\{ #\} #\,))))
                       do (write-char (ys-next ys) o)))))
     (when (zerop (length name))
       (fail-parse ys "empty anchor/alias"))
@@ -220,9 +247,11 @@
 
 (defun parse-properties (ys)
   "Optional &anchor / !tag (either order, at most one of each).
-   Returns (values anchor tag)."
+   Properties may continue after a line break (9KAX, BU8L) unless the next
+   `&`/`!` starts a mapping key (4JVG)."
   (let ((anchor nil)
-        (tag nil))
+        (tag nil)
+        (any nil))
     (loop
       (skip-blanks ys)
       (cond
@@ -230,36 +259,52 @@
          (when anchor
            (fail-parse ys "duplicate anchor"))
          (ys-next ys)
-         (setf anchor (parse-anchor-name ys)))
+         (setf anchor (parse-anchor-name ys)
+               any t))
         ((eql (ys-peek ys) #\!)
          (when tag
            (fail-parse ys "duplicate tag"))
          (ys-next ys)
-         (setf tag (resolve-tag ys (parse-tag-token ys))))
+         (setf tag (resolve-tag ys (parse-tag-token ys))
+               any t))
+        ((and any
+              (or (break-p (ys-peek ys))
+                  (comment-start-p ys)
+                  (ys-eof-p ys)))
+         (let ((saved (ys-pos ys)))
+           (when (comment-start-p ys)
+             (skip-comment ys))
+           (skip-break ys)
+           (skip-spaces ys)
+           (unless (and (or (eql (ys-peek ys) #\&) (eql (ys-peek ys) #\!))
+                        (not (looks-like-block-map-p ys))
+                        (not (looks-like-block-seq-p ys)))
+             (setf (ys-pos ys) saved)
+             (return))))
         (t (return))))
     (values anchor tag)))
 
 (defun skip-to-node-content (ys indent)
-  "After properties, skip comment/break and require indent > parent when broken."
+  "After properties, skip comment/break. Returns T if a line break was consumed.
+   Same-line properties belong to the next node (often a mapping key);
+   properties + break belong to the following collection (2SXE vs 26DV)."
+  (declare (ignore indent))
   (skip-blanks ys)
   (skip-comment ys)
-  (when (or (break-p (ys-peek ys)) (ys-eof-p ys))
-    (skip-break ys)
-    (loop
-      (skip-spaces ys)
-      (cond
-        ((eql (ys-peek ys) #\#)
-         (skip-comment ys)
-         (skip-break ys))
-        ((break-p (ys-peek ys))
-         (skip-break ys))
-        (t (return))))
-    (when (and (not (ys-eof-p ys))
-               (<= (ys-column ys) indent)
-               (not (at-marker-p ys "---"))
-               (not (at-marker-p ys "...")))
-      ;; empty node — caller sees eof / same-or-less indent
-      nil)))
+  (cond
+    ((or (break-p (ys-peek ys)) (ys-eof-p ys))
+     (skip-break ys)
+     (loop
+       (skip-spaces ys)
+       (cond
+         ((eql (ys-peek ys) #\#)
+          (skip-comment ys)
+          (skip-break ys))
+         ((break-p (ys-peek ys))
+          (skip-break ys))
+         (t (return))))
+     t)
+    (t nil)))
 
 (defun dq-unescape (ys)
   (let ((e (ys-next ys)))
@@ -289,6 +334,7 @@
        (when (and (char= e #\Return) (eql (ys-peek ys) #\Newline))
          (ys-next ys))
        :escaped-break)
+      ((blank-p e) e)                    ; `\` + tab (3RLN/01), not `\.` (55WF)
       (t (fail-parse ys "unknown escape \\~A" e)))))
 
 (defun fold-flow-break (ys chars indent)
@@ -298,16 +344,17 @@
   (skip-break ys)
   (let ((empty 0))
     (loop
-      (let ((col (ys-column ys)))
-        (loop while (space-p (ys-peek ys))
-              do (ys-next ys))
-        (cond
-          ((and (eql (ys-peek ys) #\Tab) (<= col indent))
-           (fail-parse ys "tab used as indentation"))
-          ((break-p (ys-peek ys))
-           (skip-break ys)
-           (incf empty))
-          (t (return)))))
+      (loop while (space-p (ys-peek ys))
+            do (ys-next ys))
+      (when (and (eql (ys-peek ys) #\Tab) (< (ys-column ys) indent))
+        (fail-parse ys "tab used as indentation"))
+      (loop while (blank-p (ys-peek ys))
+            do (ys-next ys))
+      (cond
+        ((break-p (ys-peek ys))
+         (skip-break ys)
+         (incf empty))
+        (t (return))))
     (loop while (blank-p (ys-peek ys))
           do (ys-next ys))
     (if (plusp empty)
@@ -326,6 +373,8 @@
           ((char= c #\")
            (ys-next ys)
            (return (coerce (nreverse chars) 'string)))
+          ((at-marker-p ys "---")
+           (fail-parse ys "document marker inside double-quoted scalar"))
           ((char= c #\\)
            (ys-next ys)
            (let ((x (dq-unescape ys)))
@@ -448,6 +497,7 @@
     (skip-break ys)
     (let* ((parent (max indent 0))
            (content-indent (and explicit-indent (+ parent explicit-indent)))
+           (max-empty 0)
            (lines '()))
       (loop
         (when (ys-eof-p ys)
@@ -460,6 +510,7 @@
                                                (< col content-indent)))
              (fail-parse ys "tab used as indentation"))
             ((or (ys-eof-p ys) (break-p (ys-peek ys)))
+             (setf max-empty (max max-empty col))
              (push "" lines)
              (skip-break ys))
             ((and content-indent (< col content-indent)
@@ -470,6 +521,8 @@
                (when (<= col parent)
                  (decf (ys-pos ys) col)
                  (return))
+               (when (and (plusp max-empty) (< col max-empty))
+                 (fail-parse ys "block scalar content indented less than preceding empty line"))
                (setf content-indent col))
              (when (< col content-indent)
                (decf (ys-pos ys) col)
@@ -514,8 +567,8 @@
              (write-string line out)
              (setf prev-empty nil first nil))
             (t
-             (unless first
-               (write-char (if prev-empty #\Newline #\Space) out))
+             (unless (or first prev-empty)
+               (write-char #\Space out))
              (write-string line out)
              (setf prev-empty nil first nil))))))))
 
@@ -552,6 +605,9 @@
       (let ((saved (ys-pos ys)))
         (unwind-protect
              (progn
+               (when (or (eql (ys-peek ys) #\&) (eql (ys-peek ys) #\!))
+                 (parse-properties ys)
+                 (skip-blanks ys))
                (cond
                  ((eql (ys-peek ys) #\")
                   (ignore-errors (parse-double-quoted ys)))
@@ -560,17 +616,15 @@
                  ((eql (ys-peek ys) #\*)
                   (ys-next ys)
                   (ignore-errors (parse-anchor-name ys)))
-                 ((or (eql (ys-peek ys) #\&) (eql (ys-peek ys) #\!))
-                  (parse-properties ys)
-                  (skip-blanks ys)
-                  (return-from looks-like-block-map-p
-                    (progn (setf (ys-pos ys) saved)
-                           (looks-like-block-map-p ys))))
                  (t
                   (loop
                     (let ((c (ys-peek ys)))
                       (cond
-                        ((or (null c) (break-p c) (eql c #\#))
+                        ((or (null c) (break-p c))
+                         (return))
+                        ((and (eql c #\#)
+                              (or (= (ys-pos ys) saved)
+                                  (blank-p (char (ys-text ys) (1- (ys-pos ys))))))
                          (return))
                         ((and (eql c #\:) (colon-ends-plain-p ys nil))
                          (return))
@@ -583,6 +637,56 @@
   (emit ys :scalar :anchor anchor :tag tag :style (or style :plain)
         :value (or value "")))
 
+(defun looks-like-flow-pair-p (ys)
+  "Implicit single-pair mapping inside a flow sequence: `key: value`."
+  (let ((saved (ys-pos ys))
+        (depth 0))
+    (unwind-protect
+         (progn
+           (skip-ws-breaks ys)
+           (when (looks-like-explicit-key-p ys)
+             (return-from looks-like-flow-pair-p t))
+           (loop
+             (let ((c (ys-peek ys)))
+               (cond
+                 ((null c) (return nil))
+                 ((eql c #\")
+                  (or (ignore-errors (parse-double-quoted ys)) (ys-next ys)))
+                 ((eql c #\')
+                  (or (ignore-errors (parse-single-quoted ys)) (ys-next ys)))
+                 ((eql c #\[) (incf depth) (ys-next ys))
+                 ((eql c #\])
+                  (when (minusp (decf depth)) (return nil))
+                  (ys-next ys))
+                 ((eql c #\{) (incf depth) (ys-next ys))
+                 ((eql c #\})
+                  (when (minusp (decf depth)) (return nil))
+                  (ys-next ys))
+                 ((and (zerop depth) (eql c #\:) (colon-ends-plain-p ys t))
+                  (return t))
+                 ((and (zerop depth) (member c '(#\, #\] #\})))
+                  (return nil))
+                 (t (ys-next ys))))))
+      (setf (ys-pos ys) saved))))
+
+(defun parse-flow-pair (ys)
+  (emit ys :mapping-start :flow-p t)
+  (if (looks-like-explicit-key-p ys)
+      (progn
+        (ys-next ys)
+        (skip-ws-breaks ys)
+        (parse-node ys :flow t :indent -1 :key :explicit))
+      (parse-node ys :flow t :indent -1 :key :implicit))
+  (skip-ws-breaks ys)
+  (unless (eql (ys-peek ys) #\:)
+    (fail-parse ys "expected : in flow pair"))
+  (ys-next ys)
+  (skip-ws-breaks ys)
+  (if (member (ys-peek ys) '(#\, #\] #\}))
+      (emit-scalar ys "")
+      (parse-node ys :flow t :indent -1))
+  (emit ys :mapping-end))
+
 (defun parse-flow-seq (ys &key anchor tag)
   (unless (eql (ys-next ys) #\[)
     (fail-parse ys "expected ["))
@@ -594,7 +698,9 @@
       (ys-next ys)
       (emit ys :sequence-end)
       (return))
-    (parse-node ys :flow t :indent -1)
+    (if (looks-like-flow-pair-p ys)
+        (parse-flow-pair ys)
+        (parse-node ys :flow t :indent -1))
     (skip-ws-breaks ys)
     (cond
       ((eql (ys-peek ys) #\])
@@ -708,6 +814,16 @@
       (skip-ws-breaks ys))
     (emit ys :sequence-end)))
 
+(defun block-value-here-p (ys indent)
+  "After `key:\\n`, a same-indent block sequence is the value (`key:\\n- item`).
+   A same-indent mapping key is the next entry, not the value (6KGN)."
+  (and (not (ys-eof-p ys))
+       (not (at-marker-p ys "---"))
+       (not (at-marker-p ys "..."))
+       (let ((col (ys-column ys)))
+         (or (> col indent)
+             (and (= col indent) (looks-like-block-seq-p ys))))))
+
 (defun parse-block-map (ys &key anchor tag)
   (let ((indent (ys-column ys)))
     (emit ys :mapping-start :anchor anchor :tag tag)
@@ -721,6 +837,8 @@
         (when (< col indent)
           (return))
         (when (looks-like-block-seq-p ys)
+          (when (> col indent)
+            (fail-parse ys "wrong indentation in block sequence"))
           (return))
         (when (eql (ys-peek ys) #\Tab)
           (fail-parse ys "tab used as indentation"))
@@ -737,8 +855,7 @@
              ((or (ys-eof-p ys) (break-p (ys-peek ys)))
               (skip-break ys)
               (skip-ws-breaks ys)
-                  (if (and (not (ys-eof-p ys))
-                       (> (ys-column ys) indent))
+              (if (block-value-here-p ys indent)
                   (parse-node ys :indent indent :key :explicit)
                   (emit-scalar ys "")))
              (t (parse-node ys :indent indent :key :explicit)))
@@ -753,10 +870,7 @@
                    ((or (ys-eof-p ys) (break-p (ys-peek ys)))
                     (skip-break ys)
                     (skip-ws-breaks ys)
-                    (if (and (not (ys-eof-p ys))
-                             (not (at-marker-p ys "---"))
-                             (not (at-marker-p ys "..."))
-                             (> (ys-column ys) indent))
+                    (if (block-value-here-p ys indent)
                         (parse-node ys :indent indent)
                         (emit-scalar ys "")))
                    (t (parse-node ys :indent indent))))
@@ -775,10 +889,7 @@
              ((or (ys-eof-p ys) (break-p (ys-peek ys)))
               (skip-break ys)
               (skip-ws-breaks ys)
-              (if (and (not (ys-eof-p ys))
-                       (not (at-marker-p ys "---"))
-                       (not (at-marker-p ys "..."))
-                       (> (ys-column ys) indent))
+              (if (block-value-here-p ys indent)
                   (parse-node ys :indent indent)
                   (emit-scalar ys "")))
              (t (parse-node ys :indent indent))))))
@@ -787,45 +898,60 @@
 
 (defun parse-node (ys &key flow (indent -1) key)
   "KEY :implicit — single-line implicit mapping key (no block collection).
-   KEY :explicit — `?` key; block collections allowed."
-  (when (eql (ys-peek ys) #\*)
-    (ys-next ys)
-    (let ((name (parse-anchor-name ys)))
-      (emit ys :alias :value name)
-      (return-from parse-node)))
-  (multiple-value-bind (anchor tag)
-      (parse-properties ys)
-    (skip-to-node-content ys indent)
-    (let ((c (ys-peek ys))
-          (allow-block (not (eq key :implicit))))
-      (cond
-        ((or (null c)
-             (and (not flow)
-                  (or (at-marker-p ys "---")
-                      (at-marker-p ys "...")
-                      (< (ys-column ys) indent))))
-         (emit-scalar ys "" :anchor anchor :tag tag))
-        ((eql c #\{)
-         (parse-flow-map ys :anchor anchor :tag tag))
-        ((eql c #\[)
-         (parse-flow-seq ys :anchor anchor :tag tag))
-        ((or (eql c #\|) (eql c #\>))
-         (multiple-value-bind (text style)
-             (parse-block-scalar ys :indent indent)
-           (emit-scalar ys text :anchor anchor :tag tag :style style)))
-        ((eql c #\")
-         (emit-scalar ys (parse-double-quoted ys :indent indent)
-                      :anchor anchor :tag tag :style :double))
-        ((eql c #\')
-         (emit-scalar ys (parse-single-quoted ys :indent indent)
-                      :anchor anchor :tag tag :style :single))
-        ((and (not flow) allow-block (looks-like-block-seq-p ys))
-         (parse-block-seq ys :anchor anchor :tag tag))
-        ((and (not flow) allow-block (looks-like-block-map-p ys))
-         (parse-block-map ys :anchor anchor :tag tag))
-        (t
-         (let ((plain (parse-plain ys :flow flow :indent indent)))
-           (emit-scalar ys plain :anchor anchor :tag tag :style :plain)))))))
+   KEY :explicit — `?` key; block collections allowed.
+   Block collections are detected before quoted/plain scalars so a document
+   whose first key is quoted (26DV) is a mapping, not a scalar."
+  (let ((saved (ys-pos ys))
+        (allow-block (not (eq key :implicit))))
+    (when (eql (ys-peek ys) #\*)
+      (when (and (not flow) allow-block (looks-like-block-map-p ys))
+        (parse-block-map ys)
+        (return-from parse-node))
+      (ys-next ys)
+      (emit ys :alias :value (parse-anchor-name ys))
+      (return-from parse-node))
+    (multiple-value-bind (anchor tag)
+        (parse-properties ys)
+      (let ((broke (skip-to-node-content ys indent))
+            (c (ys-peek ys)))
+        (flet ((collection (parse-fn)
+                 (if (and (not broke) (or anchor tag))
+                     (progn
+                       (setf (ys-pos ys) saved)
+                       (funcall parse-fn ys))
+                     (funcall parse-fn ys :anchor anchor :tag tag))))
+          (cond
+            ((or (null c)
+                 (and (not flow)
+                      (or (at-marker-p ys "---")
+                          (at-marker-p ys "...")
+                          (< (ys-column ys) indent))))
+             (emit-scalar ys "" :anchor anchor :tag tag))
+            ((eql c #\{)
+             (parse-flow-map ys :anchor anchor :tag tag))
+            ((eql c #\[)
+             (parse-flow-seq ys :anchor anchor :tag tag))
+            ((or (eql c #\|) (eql c #\>))
+             (multiple-value-bind (text style)
+                 (parse-block-scalar ys :indent indent)
+               (emit-scalar ys text :anchor anchor :tag tag :style style)))
+            ((and (not flow) allow-block (looks-like-block-seq-p ys))
+             (if (and broke (< (ys-column ys) indent))
+                 (emit-scalar ys "" :anchor anchor :tag tag)
+                 (collection #'parse-block-seq)))
+            ((and (not flow) allow-block (looks-like-block-map-p ys))
+             (if (and broke (<= (ys-column ys) indent))
+                 (emit-scalar ys "" :anchor anchor :tag tag)
+                 (collection #'parse-block-map)))
+            ((eql c #\")
+             (emit-scalar ys (parse-double-quoted ys :indent indent)
+                          :anchor anchor :tag tag :style :double))
+            ((eql c #\')
+             (emit-scalar ys (parse-single-quoted ys :indent indent)
+                          :anchor anchor :tag tag :style :single))
+            (t
+             (let ((plain (parse-plain ys :flow flow :indent indent)))
+               (emit-scalar ys plain :anchor anchor :tag tag :style :plain)))))))))
 
 (defun parse-directive-line (ys)
   "Consume a %directive at column 0. %TAG updates handles; others ignored."
@@ -896,7 +1022,7 @@
                (or (ys-eof-p ys)
                    (at-marker-p ys "...")))
       (when (at-marker-p ys "...")
-        (consume-marker ys "...")
+        (consume-end-marker ys)
         (skip-ws-breaks ys))
       (return-from parse-document nil))
     (emit ys :document-start :implicit (not explicit-start))
@@ -908,15 +1034,13 @@
       (t
        (parse-node ys :indent -1)
        (skip-ws-breaks ys)
-       (when (and (not (ys-eof-p ys))
-                  (not (at-marker-p ys "---"))
-                  (not (at-marker-p ys "..."))
-                  (eql (ys-peek ys) #\%)
-                  (at-bol-p ys))
-         (fail-parse ys "directives require a document end marker"))))
+       (unless (or (ys-eof-p ys)
+                   (at-marker-p ys "---")
+                   (at-marker-p ys "..."))
+         (fail-parse ys "unexpected content after document"))))
     (skip-ws-breaks ys)
     (when (at-marker-p ys "...")
-      (consume-marker ys "...")
+      (consume-end-marker ys)
       (setf explicit-end t)
       (skip-ws-breaks ys))
     (emit ys :document-end :implicit (not explicit-end))

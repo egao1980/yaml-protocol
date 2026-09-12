@@ -12,13 +12,25 @@
    "/"
    (namestring (enough-namestring dir root))))
 
+(defun %dir-p (p)
+  (and (null (pathname-name p)) (null (pathname-type p))))
+
+(defun %suite-index-dir-p (p)
+  "Skip yaml-test-suite `tags/` and `name/` indexes — they duplicate cases."
+  (let ((name (car (last (pathname-directory p)))))
+    (member name '("tags" "name") :test #'string=)))
+
 (defun %collect-suite-dirs (root)
   (let ((acc '()))
     (labels ((walk (dir)
-               (if (probe-file (merge-pathnames "in.yaml" dir))
-                   (push dir acc)
-                   (dolist (sub (directory (merge-pathnames "*/" dir)))
-                     (walk sub)))))
+               (cond
+                 ((%suite-index-dir-p dir))
+                 ((probe-file (merge-pathnames "in.yaml"
+                                              (uiop:ensure-directory-pathname dir)))
+                  (push (uiop:ensure-directory-pathname dir) acc))
+                 (t
+                  (dolist (sub (uiop:subdirectories dir))
+                    (walk sub))))))
       (walk root))
     (sort acc #'string< :key (lambda (p) (%case-id p root)))))
 
