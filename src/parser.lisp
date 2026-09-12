@@ -12,9 +12,16 @@
 ;;; Prefixes: c- indicator, s- space, ns- non-space, b- break, l- line,
 ;;; nb- non-break, e- empty.
 
+;;; Cursor mark is libyaml `yaml_mark_t` / SKIP: column lives on the
+;;; cursor and updates as we consume. Scanning back to the last LF on
+;;; every indent check is O(line) and O(n²) on one-line flow (go-yaml
+;;; `skip`, libyaml `SKIP` / `SKIP_LINE`). We only reset column on
+;;; `#\Newline` — same as the old backward scan (CR does not start a line).
+
 (defstruct (ys (:constructor %make-ys))
   (text "" :type string)
   (pos 0 :type fixnum)
+  (col 0 :type fixnum)
   (len 0 :type fixnum)
   (events nil)
   (tag-handles nil)
@@ -22,7 +29,7 @@
   (yaml-directive-p nil))
 
 (defun make-ys (text)
-  (%make-ys :text text :pos 0 :len (length text)
+  (%make-ys :text text :pos 0 :col 0 :len (length text)
             :events (make-array 32 :adjustable t :fill-pointer 0)
             :tag-handles (make-hash-table :test #'equal)))
 
@@ -33,26 +40,45 @@
           (gethash "!" ht) "!"
           (gethash "!!" ht) "tag:yaml.org,2002:")))
 
+(declaim (inline ys-eof-p ys-peek ys-next ys-column ys-goto ys-backup
+                 s-space-p s-tab-p s-white-p b-break-p ns-char-p))
+
 (defun ys-eof-p (ys)
   (>= (ys-pos ys) (ys-len ys)))
 
 (defun ys-peek (ys &optional (n 0))
-  (let ((i (+ (ys-pos ys) n)))
+  (declare (type ys ys) (type fixnum n))
+  (let ((i (the fixnum (+ (ys-pos ys) n))))
     (when (< i (ys-len ys))
       (char (ys-text ys) i))))
 
 (defun ys-next (ys)
-  (when (< (ys-pos ys) (ys-len ys))
-    (prog1 (char (ys-text ys) (ys-pos ys))
-      (incf (ys-pos ys)))))
+  "libyaml SKIP: advance index; column++ unless the char is LF (column = 0)."
+  (declare (type ys ys))
+  (let ((pos (ys-pos ys)))
+    (when (< pos (ys-len ys))
+      (let ((c (char (ys-text ys) pos)))
+        (setf (ys-pos ys) (the fixnum (1+ pos)))
+        (if (char= c #\Newline)
+            (setf (ys-col ys) 0)
+            (incf (ys-col ys)))
+        c))))
 
 (defun ys-column (ys)
-  (let ((text (ys-text ys))
-        (pos (ys-pos ys)))
-    (loop for i from (1- pos) downto 0
-          when (char= (char text i) #\Newline)
-            return (- pos i 1)
-          finally (return pos))))
+  (ys-col ys))
+
+(defun ys-goto (ys pos col)
+  "Restore a saved mark (libyaml marks stack / simple-key rewind)."
+  (declare (type ys ys) (type fixnum pos col))
+  (setf (ys-pos ys) pos
+        (ys-col ys) col)
+  pos)
+
+(defun ys-backup (ys n)
+  "Rewind N characters that did not include a newline."
+  (declare (type ys ys) (type fixnum n))
+  (decf (ys-pos ys) n)
+  (decf (ys-col ys) n))
 
 (defun emit (ys kind &key (implicit t) flow-p anchor tag style value)
   (vector-push-extend
@@ -62,15 +88,18 @@
    (ys-events ys)))
 
 (defmacro with-ys-checkpoint ((ys) &body body)
-  "Restore pos and event fill-pointer after a speculative parse."
+  "Restore mark (pos+col) and event fill-pointer after a speculative parse."
   (let ((pos (gensym "POS"))
+        (col (gensym "COL"))
         (fp (gensym "FP"))
         (s (gensym "YS")))
     `(let* ((,s ,ys)
             (,pos (ys-pos ,s))
+            (,col (ys-col ,s))
             (,fp (fill-pointer (ys-events ,s))))
        (unwind-protect (progn ,@body)
          (setf (ys-pos ,s) ,pos
+               (ys-col ,s) ,col
                (fill-pointer (ys-events ,s)) ,fp)))))
 
 (defun fail-parse (ys fmt &rest args)
@@ -169,15 +198,16 @@
   (loop
     (when (and (zerop (ys-column ys))
                (eql (ys-peek ys) #\Tab))
-      (let ((saved (ys-pos ys)))
+      (let ((saved (ys-pos ys))
+            (saved-col (ys-col ys)))
         (s-separate-in-line ys)
         (let ((c (ys-peek ys)))
           (unless (or (null c) (b-break-p c)
                       (member c '(#\[ #\] #\{ #\}))
                       (c-nb-comment-text-p ys))
-            (setf (ys-pos ys) saved)
+            (ys-goto ys saved saved-col)
             (fail-parse ys "tab cannot be used as indentation")))
-        (setf (ys-pos ys) saved)))
+        (ys-goto ys saved saved-col)))
     (s-separate-in-line ys)
     (cond
       ((c-nb-comment-text-p ys) (c-nb-comment-text ys))
@@ -390,7 +420,8 @@
               (or (b-break-p (ys-peek ys))
                   (c-nb-comment-text-p ys)
                   (ys-eof-p ys)))
-         (let ((saved (ys-pos ys)))
+         (let ((saved (ys-pos ys))
+               (saved-col (ys-col ys)))
            (when (c-nb-comment-text-p ys)
              (c-nb-comment-text ys))
            (b-as-line-feed ys)
@@ -399,7 +430,7 @@
                         (> (ys-column ys) indent)
                         (not (ns-s-block-map-implicit-key-p ys))
                         (not (c-sequence-entry-p ys)))
-             (setf (ys-pos ys) saved)
+             (ys-goto ys saved saved-col)
              (return))))
         (t (return))))
     (values anchor tag)))
@@ -583,6 +614,7 @@
            (when (c-forbidden-p ys)
              (return))
            (let ((saved (ys-pos ys))
+                 (saved-col (ys-col ys))
                  (saved-chars chars))
              (loop while (and chars (s-white-p (car chars)))
                    do (pop chars))
@@ -616,8 +648,8 @@
                                 (<= col indent)
                                 (let ((x (ys-peek ys 1)))
                                   (or (null x) (s-white-p x) (b-break-p x)))))
-                   (setf (ys-pos ys) saved
-                         chars saved-chars
+                   (ys-goto ys saved saved-col)
+                   (setf chars saved-chars
                          ok nil)))
                (if ok
                    (if (plusp empty)
@@ -702,13 +734,13 @@
               (t
                (unless content-indent
                  (when (<= col parent)
-                   (decf (ys-pos ys) col)
+                   (ys-backup ys col)
                    (return))
                  (when (and (plusp max-empty) (< col max-empty))
                    (fail-parse ys "block scalar content indented less than preceding empty line"))
                  (setf content-indent col))
                (when (< col content-indent)
-                 (decf (ys-pos ys) col)
+                 (ys-backup ys col)
                  (return))
                (let ((extra (- col content-indent)))
                  (push (concatenate 'string
@@ -859,6 +891,7 @@
 (defun ns-flow-pair-p (ys)
   "[150] ns-flow-pair lookahead. [149] adjacent `:` after a JSON key (9MMW)."
   (let ((saved (ys-pos ys))
+        (saved-col (ys-col ys))
         (depth 0)
         (after-json nil))
     (unwind-protect
@@ -900,7 +933,7 @@
                  (t
                   (setf after-json nil)
                   (ys-next ys))))))
-      (setf (ys-pos ys) saved))))
+      (ys-goto ys saved saved-col))))
 
 (defun colon-after-break-p (ys)
   "True when `:` is the first non-white on its line (DK4H)."
@@ -1101,7 +1134,7 @@
                         (e-node ys)))
                   (s-l+block-node ys :indent indent :in-seq t)))
              (t
-              (decf (ys-pos ys))
+              (ys-backup ys 1)
               (return))))))
       (s-l-comments ys))
     (emit ys :sequence-end)))
@@ -1131,7 +1164,8 @@
   "[63] s-indent is spaces. A tab in the separator before a block
    indicator or implicit key is an error (Y79Y)."
   (let ((saw-tab nil)
-        (saved (ys-pos ys)))
+        (saved (ys-pos ys))
+        (saved-col (ys-col ys)))
     (loop while (s-white-p (ys-peek ys))
           do (when (eql (ys-peek ys) #\Tab)
                (setf saw-tab t))
@@ -1141,7 +1175,7 @@
                            (ns-s-block-map-implicit-key-p ys)
                            (eql (ys-peek ys) #\:)))
       (fail-parse ys "tab used as indentation"))
-    (setf (ys-pos ys) saved)))
+    (ys-goto ys saved saved-col)))
 
 (defun c-l-block-map-explicit-entry (ys indent)
   "[189] c-l-block-map-explicit-entry / [190] explicit-key / [191] explicit-value"
@@ -1238,6 +1272,7 @@
    DOC-SAME-LINE — [200] s-l+block-collection needs s-l-comments; not on `---` line.
    [104] alias nodes do not take properties (SR86)."
   (let ((saved (ys-pos ys))
+        (saved-col (ys-col ys))
         (allow-block (and (not (eq key :implicit))
                           (or (not doc-same-line)))))
     (when (eql (ys-peek ys) #\*)
@@ -1268,7 +1303,7 @@
         (flet ((collection (parse-fn)
                  (if (and (not broke) (or anchor tag))
                      (progn
-                       (setf (ys-pos ys) saved)
+                       (ys-goto ys saved saved-col)
                        (funcall parse-fn ys))
                      (funcall parse-fn ys :anchor anchor :tag tag)))
                (block-coll-ok ()
