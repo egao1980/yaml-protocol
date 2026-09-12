@@ -114,6 +114,9 @@
   (let ((style (or style *default-yaml-style*)))
     (ecase style
       (:json
+       (when (graph-cyclic-p value)
+         (error 'yaml-encode-error
+                :message "cycle cannot be encoded as :json (no anchors)"))
        ;; Optional: reuse a loaded JSON backend. Not required.
        (if json-protocol:*json-backend*
            (json-protocol:encode value :stream stream)

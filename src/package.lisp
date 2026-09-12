@@ -37,6 +37,7 @@
            #:parse-events
            #:format-events
            #:compose-events
+           #:graph-cyclic-p
 
            #:yaml-serdes-backend
            #:make-yaml-serdes-backend

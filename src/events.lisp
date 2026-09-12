@@ -235,83 +235,87 @@
            (resolve-plain raw)
            raw)))))
 
+(defstruct composer
+  (events #() :type vector)
+  (index 0 :type fixnum)
+  (anchors nil))
+
+(defun %c-peek (c)
+  (when (< (composer-index c) (length (composer-events c)))
+    (yaml-event-kind (aref (composer-events c) (composer-index c)))))
+
+(defun %c-next (c)
+  (when (>= (composer-index c) (length (composer-events c)))
+    (error 'yaml-parse-error :message "unexpected end of event stream"))
+  (prog1 (aref (composer-events c) (composer-index c))
+    (incf (composer-index c))))
+
+(defun %c-expect (c kind)
+  (let ((ev (%c-next c)))
+    (unless (eq (yaml-event-kind ev) kind)
+      (error 'yaml-parse-error
+             :message (format nil "expected ~A got ~A" kind (yaml-event-kind ev))))
+    ev))
+
+(defun %c-bind (c ev object)
+  (when (yaml-event-anchor ev)
+    (setf (gethash (yaml-event-anchor ev) (composer-anchors c)) object))
+  object)
+
+(defun %compose-node (c)
+  (let ((ev (%c-next c)))
+    (ecase (yaml-event-kind ev)
+      (:alias
+       (let ((val (gethash (yaml-event-value ev) (composer-anchors c) :missing)))
+         (when (eq val :missing)
+           (error 'yaml-parse-error
+                  :message (format nil "unknown alias *~A" (yaml-event-value ev))))
+         val))
+      (:scalar
+       (%c-bind c ev (%resolve-scalar ev)))
+      (:sequence-start
+       (let ((items (make-array 0 :adjustable t :fill-pointer 0)))
+         (%c-bind c ev items)
+         (loop until (eq (%c-peek c) :sequence-end)
+               do (vector-push-extend (%compose-node c) items))
+         (%c-expect c :sequence-end)
+         items))
+      (:mapping-start
+       (let ((ht (make-hash-table :test #'equal)))
+         (%c-bind c ev ht)
+         (loop until (eq (%c-peek c) :mapping-end)
+               do (assign-map-entry ht (%compose-node c) (%compose-node c)))
+         (%c-expect c :mapping-end)
+         ht)))))
+
 (defun compose-events (events &key all)
   "Build Lisp values from an event stream.
-   ALL true → vector of documents. Empty stream → :null / #()."
-  (let ((vec (coerce events 'vector))
-        (i 0)
-        (anchors (make-hash-table :test #'equal))
+   Aliases are EQ to the anchored object. Collections are registered
+   before they are filled so cycles work. ALL true → vector of documents."
+  (let ((c (make-composer :events (coerce events 'vector)
+                          :anchors (make-hash-table :test #'equal)))
         (docs '()))
-    (labels ((peek-kind ()
-               (when (< i (length vec))
-                 (yaml-event-kind (aref vec i))))
-             (next-event ()
-               (when (>= i (length vec))
-                 (error 'yaml-parse-error :message "unexpected end of event stream"))
-               (prog1 (aref vec i)
-                 (incf i)))
-             (expect (kind)
-               (let ((ev (next-event)))
-                 (unless (eq (yaml-event-kind ev) kind)
-                   (error 'yaml-parse-error
-                          :message (format nil "expected ~A got ~A"
-                                           kind (yaml-event-kind ev))))
-                 ev))
-             (compose-node ()
-               (let ((ev (next-event)))
-                 (ecase (yaml-event-kind ev)
-                   (:alias
-                    (let ((val (gethash (yaml-event-value ev) anchors :missing)))
-                      (when (eq val :missing)
-                        (error 'yaml-parse-error
-                               :message (format nil "unknown alias *~A"
-                                                (yaml-event-value ev))))
-                      val))
-                   (:scalar
-                    (let ((val (%resolve-scalar ev)))
-                      (when (yaml-event-anchor ev)
-                        (setf (gethash (yaml-event-anchor ev) anchors) val))
-                      val))
-                   (:sequence-start
-                    (let ((items '())
-                          (anchor (yaml-event-anchor ev)))
-                      (loop until (eq (peek-kind) :sequence-end)
-                            do (push (compose-node) items))
-                      (expect :sequence-end)
-                      (let ((vec (coerce (nreverse items) 'vector)))
-                        (when anchor
-                          (setf (gethash anchor anchors) vec))
-                        vec)))
-                   (:mapping-start
-                    (let ((ht (make-hash-table :test #'equal))
-                          (anchor (yaml-event-anchor ev)))
-                      (when anchor
-                        (setf (gethash anchor anchors) ht))
-                      (loop until (eq (peek-kind) :mapping-end)
-                            do (let ((k (compose-node))
-                                     (v (compose-node)))
-                                 (assign-map-entry ht k v)))
-                      (expect :mapping-end)
-                      ht))))))
-      (expect :stream-start)
-      (loop
-        (let ((k (peek-kind)))
-          (cond
-            ((or (null k) (eq k :stream-end))
-             (return))
-            ((eq k :document-start)
-             (next-event)
-             (setf anchors (make-hash-table :test #'equal))
-             (if (eq (peek-kind) :document-end)
-                 (push :null docs)
-                 (push (compose-node) docs))
-             (expect :document-end))
-            (t
-             (error 'yaml-parse-error
-                    :message (format nil "unexpected event ~A" k))))))
-      (when (eq (peek-kind) :stream-end)
-        (next-event))
-      (let ((docs (nreverse docs)))
-        (if all
-            (coerce docs 'vector)
-            (if docs (first docs) :null))))))
+    (%c-expect c :stream-start)
+    (loop
+      (let ((k (%c-peek c)))
+        (cond
+          ((or (null k) (eq k :stream-end))
+           (return))
+          ((eq k :document-start)
+           (%c-next c)
+           (setf (composer-anchors c) (make-hash-table :test #'equal))
+           (if (eq (%c-peek c) :document-end)
+               (push :null docs)
+               (push (%compose-node c) docs))
+           (%c-expect c :document-end))
+          (t
+           (error 'yaml-parse-error
+                  :message (format nil "unexpected event ~A" k))))))
+    (when (eq (%c-peek c) :stream-end)
+      (%c-next c))
+    (setf docs (nreverse docs))
+    (if all
+        (coerce docs 'vector)
+        (if docs
+            (first docs)
+            :null))))

@@ -1,17 +1,23 @@
 (in-package #:yaml-protocol/tests)
 
-(defun %lisp= (a b)
+(defun %lisp= (a b &optional (seen (make-hash-table :test #'eq)))
   (cond
+    ((eq a b) t)
     ((and (hash-table-p a) (hash-table-p b))
-     (and (= (hash-table-count a) (hash-table-count b))
-          (loop for k being the hash-keys of a using (hash-value v)
-                always (and (nth-value 1 (gethash k b))
-                            (%lisp= v (gethash k b))))))
+     (let ((pair (cons a b)))
+       (or (gethash pair seen)
+           (progn
+             (setf (gethash a seen) b)
+             (and (= (hash-table-count a) (hash-table-count b))
+                  (loop for k being the hash-keys of a using (hash-value v)
+                        always (and (nth-value 1 (gethash k b))
+                                    (%lisp= v (gethash k b) seen))))))))
     ((and (vectorp a) (not (stringp a))
           (vectorp b) (not (stringp b)))
-     (and (= (length a) (length b))
-          (loop for i from 0 below (length a)
-                always (%lisp= (aref a i) (aref b i)))))
+     (or (eq a b)
+         (and (= (length a) (length b))
+              (loop for i from 0 below (length a)
+                    always (%lisp= (aref a i) (aref b i) seen)))))
     ((and (floatp a) (floatp b))
      (< (abs (- a b)) 1d-9))
     ((and (numberp a) (numberp b))
@@ -134,6 +140,39 @@
     (ok (= 36 (%person-age p))))
   (let ((ht (decode (format nil "name: Ada~%"))))
     (ok (hash-table-p ht))))
+
+(deftest yaml-alias-is-eq
+  "Compose shares the object. Cycles are allowed."
+  (let ((v (decode (format nil "a: &x [1, 2]~%b: *x~%"))))
+    (ok (eq (gethash "a" v) (gethash "b" v))))
+  (let ((cyc (decode (format nil "&s~%- 1~%- *s~%"))))
+    (ok (vectorp cyc))
+    (ok (= 1 (aref cyc 0)))
+    (ok (eq cyc (aref cyc 1))))
+  (let ((m (decode (format nil "&m~%self: *m~%n: 1~%"))))
+    (ok (eq m (gethash "self" m)))
+    (ok (= 1 (gethash "n" m)))))
+
+(deftest yaml-encode-cycle-uses-visited-ids
+  (let ((m (make-hash-table :test #'equal)))
+    (setf (gethash "self" m) m
+          (gethash "n" m) 1)
+    (ok (graph-cyclic-p m))
+    (let ((text (encode m :style :block)))
+      (ok (search "&id" text))
+      (ok (search "*id" text))
+      (let ((round (decode text)))
+        (ok (eq round (gethash "self" round)))
+        (ok (= 1 (gethash "n" round)))))
+    (ok (signals (encode m :style :json) 'yaml-encode-error)))
+  (let ((v (make-array 2 :adjustable t :fill-pointer 2)))
+    (setf (aref v 0) 1
+          (aref v 1) v)
+    (let ((text (encode v :style :block)))
+      (ok (search "&id" text))
+      (ok (search "*id" text))
+      (let ((round (decode text)))
+        (ok (eq round (aref round 1)))))))
 
 (deftest yaml-events-smoke
   (let ((ev (parse-events (format nil "a: &x 1~%b: *x~%"))))

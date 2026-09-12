@@ -160,21 +160,24 @@
                     dir))
             (%collect-suite-dirs root))))
 
-(deftest-parametrize yaml-test-suite
-    ((id dir) :ids (mapcar #'first *suite-cases*)
-     :rows *suite-cases*)
-  (let* ((in-yaml (%slurp (merge-pathnames "in.yaml" dir)))
-         (gold (%slurp (merge-pathnames "test.event" dir)))
-         (err-p (probe-file (merge-pathnames "error" dir)))
-         (in-json-path (merge-pathnames "in.json" dir)))
-    (if err-p
-        (ok (signals (parse-events in-yaml) 'yaml-parse-error)
-            (format nil "~A should be invalid" id))
-        (progn
-          (let ((got (%normalize-nl (format-events (parse-events in-yaml)))))
-            (ok (string= (%normalize-nl gold) got)
-                (format nil "~A events" id)))
-          (when (probe-file in-json-path)
-            (ok (%lisp= (%read-json (%slurp in-json-path))
-                        (decode in-yaml))
-                (format nil "~A json" id)))))))
+(deftest yaml-test-suite
+  "All yaml-test-suite data-2022-01-17 cases (events + compose + errors)."
+  (ok (plusp (length *suite-cases*)) "suite corpus present")
+  (dolist (row *suite-cases*)
+    (destructuring-bind (id dir) row
+      (testing id
+        (let* ((in-yaml (%slurp (merge-pathnames "in.yaml" dir)))
+               (gold (%slurp (merge-pathnames "test.event" dir)))
+               (err-p (probe-file (merge-pathnames "error" dir)))
+               (in-json-path (merge-pathnames "in.json" dir)))
+          (if err-p
+              (ok (signals (parse-events in-yaml) 'yaml-parse-error)
+                  (format nil "~A should be invalid" id))
+              (progn
+                (let ((got (%normalize-nl (format-events (parse-events in-yaml)))))
+                  (ok (string= (%normalize-nl gold) got)
+                      (format nil "~A events" id)))
+                (when (probe-file in-json-path)
+                  (ok (%lisp= (%read-json (%slurp in-json-path))
+                              (decode in-yaml))
+                      (format nil "~A json" id))))))))))

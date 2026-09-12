@@ -1,7 +1,117 @@
 (in-package #:yaml-protocol)
 
-;;; YAML 1.2 emitter. :json style is valid YAML (JSON schema). :block uses
-;;; indent mappings/sequences. Same Lisp mapping as json-protocol.
+;;; YAML 1.2 emitter. :block is default. :json is JSON-schema YAML (no anchors).
+;;; Cycles / shared objects: two-pass. Count by EQ, assign ids, then emit
+;;; with a visited set — first time &id, later *id. :json errors on a cycle.
+
+(defvar *emit-ctx* nil)
+
+(defstruct emit-ctx
+  (ids (make-hash-table :test #'eq))
+  (emitted (make-hash-table :test #'eq)))
+
+(defun %container-p (value)
+  (or (hash-table-p value)
+      (and (vectorp value) (not (stringp value)))
+      (consp value)))
+
+(defun %nonempty-container-p (value)
+  (cond
+    ((hash-table-p value) (plusp (hash-table-count value)))
+    ((and (vectorp value) (not (stringp value))) (plusp (length value)))
+    ((consp value) t)
+    (t nil)))
+
+(defun %cycle-safe-alist-p (list)
+  (let ((seen (make-hash-table :test #'eq)))
+    (loop for cell = list then (cdr cell)
+          while (consp cell)
+          do (when (gethash cell seen)
+               (return-from %cycle-safe-alist-p nil))
+             (setf (gethash cell seen) t)
+             (let ((pair (car cell)))
+               (unless (and (consp pair)
+                            (or (stringp (car pair)) (symbolp (car pair))))
+                 (return-from %cycle-safe-alist-p nil)))
+          finally (return (null cell)))))
+
+(defun %walk-count (value counts)
+  (unless (%container-p value)
+    (return-from %walk-count))
+  (let ((n (incf (gethash value counts 0))))
+    (when (= n 1)
+      (cond
+        ((hash-table-p value)
+         (maphash (lambda (k v)
+                    (%walk-count k counts)
+                    (%walk-count v counts))
+                  value))
+        ((and (vectorp value) (not (stringp value)))
+         (loop for i from 0 below (length value)
+               do (%walk-count (aref value i) counts)))
+        ((consp value)
+         (let ((seen (make-hash-table :test #'eq)))
+           (loop for cell = value then (cdr cell)
+                 while (consp cell)
+                 until (gethash cell seen)
+                 do (setf (gethash cell seen) t)
+                    (%walk-count (car cell) counts)
+                 finally (when (and cell (not (consp cell)))
+                           (%walk-count cell counts)))))))))
+
+(defun %make-emit-ctx (root)
+  (let ((counts (make-hash-table :test #'eq))
+        (ids (make-hash-table :test #'eq))
+        (n 0))
+    (%walk-count root counts)
+    (maphash (lambda (obj c)
+               (when (>= c 2)
+                 (incf n)
+                 (setf (gethash obj ids) (format nil "id~D" n))))
+             counts)
+    (make-emit-ctx :ids ids :emitted (make-hash-table :test #'eq))))
+
+(defun %anchor-id (value)
+  (and *emit-ctx* (gethash value (emit-ctx-ids *emit-ctx*))))
+
+(defun %already-emitted-p (value)
+  (and *emit-ctx* (gethash value (emit-ctx-emitted *emit-ctx*))))
+
+(defun %mark-emitted (value)
+  (when *emit-ctx*
+    (setf (gethash value (emit-ctx-emitted *emit-ctx*)) t)))
+
+(defun %emit-inline-p (value)
+  (or (not (%nonempty-container-p value))
+      (and (%anchor-id value) (%already-emitted-p value))))
+
+(defun graph-cyclic-p (value &optional (visiting (make-hash-table :test #'eq)))
+  "T if VALUE's object graph has a back-edge (EQ visited set)."
+  (unless (%container-p value)
+    (return-from graph-cyclic-p nil))
+  (when (gethash value visiting)
+    (return-from graph-cyclic-p t))
+  (setf (gethash value visiting) t)
+  (prog1
+      (cond
+        ((hash-table-p value)
+         (loop for v being the hash-values of value
+               thereis (graph-cyclic-p v visiting)))
+        ((and (vectorp value) (not (stringp value)))
+         (loop for i from 0 below (length value)
+               thereis (graph-cyclic-p (aref value i) visiting)))
+        ((consp value)
+         (let ((seen (make-hash-table :test #'eq)))
+           (loop for cell = value then (cdr cell)
+                 while (consp cell)
+                 thereis (or (gethash cell seen)
+                             (progn
+                               (setf (gethash cell seen) t)
+                               (graph-cyclic-p (car cell) visiting)))
+                 finally (return (and cell (not (consp cell))
+                                      (graph-cyclic-p cell visiting))))))
+        (t nil))
+    (remhash value visiting)))
 
 (defun %safe-plain-p (s)
   (and (plusp (length s))
@@ -34,7 +144,29 @@
   (dotimes (i n)
     (write-char #\Space stream)))
 
+(defun %write-anchor (value stream indent)
+  (let ((id (%anchor-id value)))
+    (when id
+      (format stream "&~A" id)
+      (%mark-emitted value)
+      (if (%nonempty-container-p value)
+          (progn
+            (write-char #\Newline stream)
+            (%indent stream indent))
+          (write-char #\Space stream))
+      t)))
+
+(defun %write-alias (value stream)
+  (format stream "*~A" (%anchor-id value)))
+
 (defun emit-block (value stream &optional (indent 0) &key (first t))
+  (unless *emit-ctx*
+    (let ((*emit-ctx* (%make-emit-ctx value)))
+      (return-from emit-block
+        (emit-block value stream indent :first first))))
+  (when (and (%container-p value) (%anchor-id value) (%already-emitted-p value))
+    (%write-alias value stream)
+    (return-from emit-block))
   (cond
     ((eq value :null)
      (write-string "null" stream))
@@ -52,29 +184,31 @@
      (let ((*read-default-float-format* 'double-float))
        (princ value stream)))
     ((hash-table-p value)
+     (%write-anchor value stream indent)
      (if (zerop (hash-table-count value))
          (write-string "{}" stream)
          (let ((keys (sort (loop for k being the hash-keys of value
                                  collect k)
-                           #'string<)))
+                           #'string< :key #'princ-to-string)))
            (loop for k in keys
                  for i from 0
                  do (unless (and first (zerop i))
                       (write-char #\Newline stream)
                       (%indent stream indent))
-                    (if (%safe-plain-p k)
-                        (write-string k stream)
-                        (%emit-quoted k stream))
+                    (let ((ks (if (stringp k) k (princ-to-string k))))
+                      (if (%safe-plain-p ks)
+                          (write-string ks stream)
+                          (%emit-quoted ks stream)))
                     (write-string ": " stream)
                     (let ((v (gethash k value)))
-                      (if (or (and (hash-table-p v) (plusp (hash-table-count v)))
-                              (and (vectorp v) (not (stringp v)) (plusp (length v))))
+                      (if (%emit-inline-p v)
+                          (emit-block v stream (+ indent 2) :first t)
                           (progn
                             (write-char #\Newline stream)
                             (%indent stream (+ indent 2))
-                            (emit-block v stream (+ indent 2) :first t))
-                          (emit-block v stream (+ indent 2) :first t)))))))
+                            (emit-block v stream (+ indent 2) :first t))))))))
     ((and (vectorp value) (not (stringp value)))
+     (%write-anchor value stream indent)
      (if (zerop (length value))
          (write-string "[]" stream)
          (loop for i from 0 below (length value)
@@ -82,16 +216,28 @@
                     (write-char #\Newline stream)
                     (%indent stream indent))
                   (write-string "- " stream)
-                  (let ((v (aref value i)))
-                    (if (or (and (hash-table-p v) (plusp (hash-table-count v)))
-                            (and (vectorp v) (not (stringp v)) (plusp (length v))))
-                        (emit-block v stream (+ indent 2) :first t)
-                        (emit-block v stream (+ indent 2) :first t))))))
-    ((and (consp value) (every #'consp value)
-          (every (lambda (c) (or (stringp (car c)) (symbolp (car c)))) value))
+                  (emit-block (aref value i) stream (+ indent 2) :first t))))
+    ((and (consp value) (not (%anchor-id value)) (%cycle-safe-alist-p value))
      (emit-block (%alist-to-ht value) stream indent :first first))
     ((consp value)
-     (emit-block (coerce value 'vector) stream indent :first first))
+     (%write-anchor value stream indent)
+     (let ((seen (make-hash-table :test #'eq))
+           (i 0))
+       (loop for cell = value then (cdr cell)
+             while (consp cell)
+             until (gethash cell seen)
+             do (setf (gethash cell seen) t)
+                (unless (and first (zerop i))
+                  (write-char #\Newline stream)
+                  (%indent stream indent))
+                (write-string "- " stream)
+                (emit-block (car cell) stream (+ indent 2) :first t)
+                (incf i)
+             finally (when (and cell (not (consp cell)))
+                       (write-char #\Newline stream)
+                       (%indent stream indent)
+                       (write-string "- " stream)
+                       (emit-block cell stream (+ indent 2) :first t)))))
     (t
      (error 'yaml-encode-error
             :message (format nil "cannot encode ~S as YAML" value)))))
@@ -110,8 +256,13 @@
       k
       (string-downcase (string k))))
 
-(defun emit-json (value stream)
-  "JSON-schema YAML (flow). Does not need a json-protocol backend."
+(defun emit-json (value stream &optional (visiting (make-hash-table :test #'eq)))
+  "JSON-schema YAML (flow). No anchors. Cycle → yaml-encode-error."
+  (when (%container-p value)
+    (when (gethash value visiting)
+      (error 'yaml-encode-error
+             :message "cycle cannot be encoded as :json (no anchors)"))
+    (setf (gethash value visiting) t))
   (cond
     ((eq value :null)
      (write-string "null" stream))
@@ -136,20 +287,32 @@
                   (write-char #\, stream))
                 (%emit-quoted (%json-key k) stream)
                 (write-char #\: stream)
-                (emit-json (gethash k value) stream)))
+                (emit-json (gethash k value) stream visiting)))
      (write-char #\} stream))
     ((and (vectorp value) (not (stringp value)))
      (write-char #\[ stream)
      (loop for i from 0 below (length value)
            do (unless (zerop i)
                 (write-char #\, stream))
-              (emit-json (aref value i) stream))
+              (emit-json (aref value i) stream visiting))
      (write-char #\] stream))
-    ((and (consp value) (every #'consp value)
-          (every (lambda (c) (or (stringp (car c)) (symbolp (car c)))) value))
-     (emit-json (%alist-to-ht value) stream))
+    ((and (consp value) (%cycle-safe-alist-p value))
+     (emit-json (%alist-to-ht value) stream visiting))
     ((consp value)
-     (emit-json (coerce value 'vector) stream))
+     (write-char #\[ stream)
+     (let ((seen (make-hash-table :test #'eq))
+           (i 0))
+       (loop for cell = value then (cdr cell)
+             while (consp cell)
+             until (gethash cell seen)
+             do (setf (gethash cell seen) t)
+                (unless (zerop i)
+                  (write-char #\, stream))
+                (emit-json (car cell) stream visiting)
+                (incf i)))
+     (write-char #\] stream))
     (t
      (error 'yaml-encode-error
-            :message (format nil "cannot encode ~S as YAML" value)))))
+            :message (format nil "cannot encode ~S as YAML" value))))
+  (when (%container-p value)
+    (remhash value visiting)))

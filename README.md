@@ -43,8 +43,12 @@ Compose **always** builds this Lisp graph (same as json-protocol):
 | false / true | `nil` / `t` |
 | int / float | integer / double-float |
 | string | string |
-| alias | the anchored object (`eq`) |
+| alias | the **same** object (`eq`) — not a copy |
 | `<<` | compose-time merge; existing keys win |
+
+Anchors are registered **before** a collection is filled, so `&a [1, *a]` and `&m {self: *m}` are cyclic graphs. Hash-tables and vectors (and cons) are references; `eq` is identity.
+
+**Encode (`:block`)** walks twice: count `eq` hits, assign `idN` to objects seen ≥2 times, then emit with a **visited set** — first time `&idN`, later `*idN`. `:style :json` has no aliases: a cycle (`graph-cyclic-p`, gray/visited set) is `yaml-encode-error`. Do not walk a composed value without a seen table.
 
 `:object-class` is optional and runs **after** compose, **once per document root**:
 
