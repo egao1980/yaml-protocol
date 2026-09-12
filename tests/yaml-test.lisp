@@ -135,6 +135,16 @@
   (let ((ht (decode (format nil "name: Ada~%"))))
     (ok (hash-table-p ht))))
 
+(deftest yaml-events-smoke
+  (let ((ev (parse-events (format nil "a: &x 1~%b: *x~%"))))
+    (ok (equal '(:stream-start :document-start :mapping-start
+                 :scalar :scalar :scalar :alias
+                 :mapping-end :document-end :stream-end)
+               (mapcar #'yaml-event-kind ev)))
+    (ok (string= "x" (yaml-event-anchor (nth 4 ev))))
+    (ok (string= "x" (yaml-event-value (nth 6 ev))))
+    (ok (search "=ALI *x" (format-events ev)))))
+
 (deftest yaml-extends-json
   "YAML is a CLOS extension of JSON, not a sibling and not the parent."
   (ok (subtypep 'yaml-backend 'json:json-backend))

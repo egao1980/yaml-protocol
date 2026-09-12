@@ -25,6 +25,19 @@
            #:true-p
            #:false-p
 
+           #:yaml-event
+           #:yaml-event-p
+           #:yaml-event-kind
+           #:yaml-event-implicit
+           #:yaml-event-flow-p
+           #:yaml-event-anchor
+           #:yaml-event-tag
+           #:yaml-event-style
+           #:yaml-event-value
+           #:parse-events
+           #:format-events
+           #:compose-events
+
            #:yaml-serdes-backend
            #:make-yaml-serdes-backend
            #:use-yaml-serdes-backend))

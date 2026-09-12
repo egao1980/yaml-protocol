@@ -20,7 +20,7 @@
 (defgeneric backend-decode (backend source &key all object-class)
   (:documentation "Decode SOURCE (string, octets, or character stream).
    ALL true → vector of documents.
-   OBJECT-CLASS when non-nil initializes a CLOS instance from a mapping."))
+   OBJECT-CLASS is post-compose (see INITIALIZE-OBJECT)."))
 
 (defun null-p (object)
   (json-protocol:null-p object))
@@ -48,18 +48,39 @@
   (make-instance 'native-yaml-backend))
 
 (defun initialize-object (class table)
-  "Optional object initialization from a mapping. CLASS is a class designator or function."
+  "Post-compose object initialization. CLASS is:
+   - NIL — leave the composed value (hash-table / vector / scalar)
+   - a function designator — (FUNCALL CLASS composed)
+   - a class designator — MAKE-INSTANCE with keyword initargs from mapping
+     keys (STRING-UPCASE interned in KEYWORD). Nested mappings stay
+     hash-tables. Non-mapping root → yaml-parse-error."
   (cond
     ((null class) table)
     ((functionp class) (funcall class table))
+    ((and (symbolp class) (fboundp class) (not (find-class class nil)))
+     (funcall class table))
     ((not (hash-table-p table))
      (error 'yaml-parse-error
             :message "object-class requires a mapping at the document root"))
     (t
      (apply #'make-instance class
             (loop for k being the hash-keys of table using (hash-value v)
-                  collect (intern (string-upcase k) :keyword)
+                  collect (intern (string-upcase (if (stringp k)
+                                                     k
+                                                     (princ-to-string k)))
+                                  :keyword)
                   collect v)))))
+
+(defun parse-events (source)
+  "Parse SOURCE to a list of YAML-EVENT (yaml-test-suite event DSL)."
+  (unless *yaml-backend*
+    (error 'yaml-parse-error :message "*yaml-backend* is unbound — load yaml-protocol"))
+  (handler-case
+      (parse-events-from-string (%source-string source))
+    (yaml-error (e) (error e))
+    (error (e)
+      (error 'yaml-parse-error
+             :message (format nil "YAML parse failed: ~A" e)))))
 
 (defmethod backend-decode ((backend native-yaml-backend) source
                            &key all object-class)
@@ -111,7 +132,8 @@
 
 (defun decode (source &key object-class)
   "Decode the first YAML 1.2 document. Valid JSON is valid YAML.
-   OBJECT-CLASS optionally initializes a CLOS instance (or a function of the mapping)."
+   Empty / comment-only stream → :null.
+   OBJECT-CLASS is optional post-compose initialization (see INITIALIZE-OBJECT)."
   (unless *yaml-backend*
     (error 'yaml-parse-error :message "*yaml-backend* is unbound — load yaml-protocol"))
   (backend-decode *yaml-backend* source :object-class object-class))

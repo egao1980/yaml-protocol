@@ -1,6 +1,6 @@
 (defsystem "yaml-protocol"
-  :version "0.1.2"
-  :description "CLOS YAML 1.2 encode/decode; extends json-protocol (JSON ⊂ YAML); implements serdes-protocol :yaml"
+  :version "0.2.0"
+  :description "CLOS YAML 1.2 event parser/composer; extends json-protocol (JSON ⊂ YAML); implements serdes-protocol :yaml"
   :author "egao1980"
   :license "MIT"
   :depends-on ("encoding-protocol" "json-protocol" "serdes-protocol")
@@ -9,6 +9,7 @@
   :pathname "src"
   :components ((:file "package")
                (:file "conditions")
+               (:file "events")
                (:file "parser")
                (:file "emitter")
                (:file "protocol")
@@ -21,7 +22,8 @@
   :serial t
   :components ((:file "package")
                (:file "yaml-test")
-               (:file "json-interop-test"))
+               (:file "json-interop-test")
+               (:file "suite-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
