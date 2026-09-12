@@ -4,7 +4,9 @@
 ;;; Parser emits events; compose builds the Lisp graph. Aliases / << / Core
 ;;; schema are compose-time. :object-class is post-compose (see protocol.lisp).
 
-(defstruct (yaml-event (:constructor make-yaml-event))
+(defstruct (yaml-event
+            (:constructor make-yaml-event)
+            (:constructor %yaml-event (kind implicit flow-p anchor tag style value)))
   (kind :scalar :type keyword)
   (implicit t)
   (flow-p nil)
@@ -13,15 +15,42 @@
   (style :plain)
   (value nil))
 
+(declaim (inline hex-digit-p))
+
 (defun hex-digit-p (c)
+  (declare (optimize (speed 3) (safety 1)))
   (and c (or (char<= #\0 c #\9)
              (char<= #\a c #\f)
              (char<= #\A c #\F))))
 
+(defun %all-hex-p (s start end)
+  (declare (type string s) (type fixnum start end)
+           (optimize (speed 3) (safety 1)))
+  (when (>= start end)
+    (return-from %all-hex-p nil))
+  (loop for i from start below end
+        always (hex-digit-p (char s i))))
+
+(defun %all-oct-p (s start end)
+  (declare (type string s) (type fixnum start end)
+           (optimize (speed 3) (safety 1)))
+  (when (>= start end)
+    (return-from %all-oct-p nil))
+  (loop for i from start below end
+        always (char<= #\0 (char s i) #\7)))
+
+(defun %all-digits-p (s start end)
+  (declare (type string s) (type fixnum start end)
+           (optimize (speed 3) (safety 1)))
+  (loop for i from start below end
+        always (char<= #\0 (char s i) #\9)))
+
 (defun %core-integer (s)
+  (declare (type string s) (optimize (speed 3) (safety 1)))
   (let ((sign 1)
         (start 0)
         (n (length s)))
+    (declare (type fixnum start n) (type (integer -1 1) sign))
     (when (zerop n)
       (return-from %core-integer nil))
     (cond
@@ -30,35 +59,35 @@
     (when (>= start n)
       (return-from %core-integer nil))
     (cond
-      ((and (>= (- n start) 3)
+      ((and (>= (the fixnum (- n start)) 3)
             (char= (char s start) #\0)
             (or (char= (char s (1+ start)) #\x)
                 (char= (char s (1+ start)) #\X)))
-       (let ((rest (subseq s (+ start 2))))
-         (when (and (plusp (length rest))
-                    (every #'hex-digit-p rest))
-           (* sign (parse-integer rest :radix 16)))))
-      ((and (>= (- n start) 3)
+       (let ((from (the fixnum (+ start 2))))
+         (when (%all-hex-p s from n)
+           (* sign (parse-integer s :start from :end n :radix 16)))))
+      ((and (>= (the fixnum (- n start)) 3)
             (char= (char s start) #\0)
             (or (char= (char s (1+ start)) #\o)
                 (char= (char s (1+ start)) #\O)))
-       (let ((rest (subseq s (+ start 2))))
-         (when (and (plusp (length rest))
-                    (every (lambda (c) (char<= #\0 c #\7)) rest))
-           (* sign (parse-integer rest :radix 8)))))
+       (let ((from (the fixnum (+ start 2))))
+         (when (%all-oct-p s from n)
+           (* sign (parse-integer s :start from :end n :radix 8)))))
       ((and (char= (char s start) #\0) (= n (1+ start)))
        0)
       ((and (char<= #\1 (char s start) #\9)
-            (every #'digit-char-p (subseq s start)))
-       (* sign (parse-integer s :start start)))
+            (%all-digits-p s start n))
+       (* sign (parse-integer s :start start :end n)))
       ((and (char= (char s start) #\0)
-            (every #'digit-char-p (subseq s start))
+            (%all-digits-p s start n)
             (= n (1+ start)))
        0)
       (t nil))))
 
 (defun %core-float (s)
+  (declare (type string s) (optimize (speed 3) (safety 1)))
   (let ((n (length s)))
+    (declare (type fixnum n))
     (when (zerop n)
       (return-from %core-float nil))
     (flet ((inf-p (x)
@@ -79,18 +108,22 @@
          (let ((s (find-symbol "DOUBLE-FLOAT-NAN")))
            (if (and s (boundp s)) (symbol-value s) nil)))
         (t
-         (when (and (find-if (lambda (c)
-                               (or (char= c #\.) (char= c #\e) (char= c #\E)))
-                             s)
-                    (every (lambda (c)
-                             (or (digit-char-p c)
-                                 (member c '(#\+ #\- #\. #\e #\E))))
-                           s))
-           (let* ((*read-default-float-format* 'double-float)
-                  (*read-eval* nil))
-             (ignore-errors
-               (let ((v (read-from-string s)))
-                 (and (numberp v) (float v 1.0d0)))))))))))
+         (let ((dot-or-exp nil)
+               (ok t))
+           (loop for i from 0 below n
+                 for c = (char s i)
+                 do (cond
+                      ((or (char= c #\.) (char= c #\e) (char= c #\E))
+                       (setf dot-or-exp t))
+                      ((or (char<= #\0 c #\9)
+                           (char= c #\+) (char= c #\-)))
+                      (t (setf ok nil))))
+           (when (and ok dot-or-exp)
+             (let* ((*read-default-float-format* 'double-float)
+                    (*read-eval* nil))
+               (ignore-errors
+                 (let ((v (read-from-string s)))
+                   (and (numberp v) (float v 1.0d0))))))))))))
 
 (defun resolve-plain (s)
   "YAML 1.2 Core schema on a plain scalar (not 1.1 — NO is a string)."
@@ -326,7 +359,7 @@
             :null))))
 
 ;;; Live compose (decode only). Events never materialize. Lookaheads must
-;;; nil ys-sink and scratch on the event vector (with-ys-checkpoint).
+;;; nil ys-live and scratch on the event vector (with-ys-checkpoint).
 
 (defstruct (lframe (:constructor %lframe (kind container)))
   (kind :seq :type keyword)
@@ -343,12 +376,15 @@
 (defun make-live-composer ()
   (%make-live-composer :anchors (make-hash-table :test #'equal)))
 
+(declaim (inline live-bind live-place))
+
 (defun live-bind (live object anchor)
   (when anchor
     (setf (gethash anchor (live-composer-anchors live)) object))
   object)
 
 (defun live-place (live object)
+  (declare (optimize (speed 3) (safety 1)))
   (let ((frame (car (live-composer-stack live))))
     (cond
       ((null frame)
@@ -367,8 +403,9 @@
                    (lframe-pending-key frame) nil))))))
   object)
 
-(defun live-on-event (live kind &key implicit flow-p anchor tag style value)
-  (declare (ignore implicit flow-p))
+(defun live-on-event (live kind implicit flow-p anchor tag style value)
+  (declare (ignore implicit flow-p)
+           (optimize (speed 3) (safety 1)))
   (ecase kind
     (:stream-start)
     (:stream-end)

@@ -19,53 +19,40 @@
 ;;; `#\Newline` — same as the old backward scan (CR does not start a line).
 
 (defstruct (ys (:constructor %make-ys))
-  (text "" :type string)
+  (text "" :type simple-string)
   (pos 0 :type fixnum)
   (col 0 :type fixnum)
   (len 0 :type fixnum)
   (events nil)
   (buf nil)
-  (sink nil)
+  (live nil)
   (tag-handles nil)
   (parent-indent -1 :type fixnum)
   (yaml-directive-p nil))
 
-(defun estimate-event-capacity (text)
-  "ryml estimate_tree_capacity: \\n , [ { plus YAML - :."
-  (declare (type string text))
-  (let ((n 8))
-    (loop for c across text
-          when (or (char= c #\Newline) (char= c #\,)
-                   (char= c #\[) (char= c #\{)
-                   (char= c #\-) (char= c #\:))
-            do (incf n))
-    (max 32 n)))
+(defun %simple-text (text)
+  (let ((text (or text "")))
+    (if (simple-string-p text) text (copy-seq text))))
 
 (defun make-ys (text)
-  (let ((text (or text "")))
+  (let ((text (%simple-text text)))
     (%make-ys :text text :pos 0 :col 0 :len (length text)
-              :events (make-array (estimate-event-capacity text)
-                                  :adjustable t :fill-pointer 0)
-              :buf (make-array 64 :element-type 'character
+              :events (make-array 64 :adjustable t :fill-pointer 0)
+              :buf (make-array 256 :element-type 'character
                                :adjustable t :fill-pointer 0)
               :tag-handles (make-hash-table :test #'equal))))
-
 (defvar *ys-cache* nil)
 
 (defun reset-ys (ys text)
-  (let* ((text (or text ""))
-         (n (estimate-event-capacity text))
-         (ev (ys-events ys)))
+  (let ((text (%simple-text text)))
     (setf (ys-text ys) text
           (ys-pos ys) 0
           (ys-col ys) 0
           (ys-len ys) (length text)
           (ys-parent-indent ys) -1
-          (ys-sink ys) nil)
-    (setf (fill-pointer ev) 0)
-    (when (< (array-dimension ev 0) n)
-      (adjust-array ev n))
-    (setf (fill-pointer (ys-buf ys)) 0)
+          (ys-live ys) nil
+          (fill-pointer (ys-events ys)) 0
+          (fill-pointer (ys-buf ys)) 0)
     (reset-tag-handles ys)
     ys))
 
@@ -80,7 +67,7 @@
 (defun release-ys (ys)
   (setf (ys-text ys) ""
         (ys-len ys) 0
-        (ys-sink ys) nil
+        (ys-live ys) nil
         (fill-pointer (ys-events ys)) 0
         (fill-pointer (ys-buf ys)) 0)
   (setf *ys-cache* ys)
@@ -95,13 +82,33 @@
     (setf (fill-pointer ev) 0)
     out))
 
-(declaim (inline ys-buf-clear ys-buf-push ys-buf-take))
+(declaim (inline ys-buf-clear ys-buf-push ys-buf-take ys-buf-nspaces ys-buf-append))
 
 (defun ys-buf-clear (ys)
   (setf (fill-pointer (ys-buf ys)) 0))
 
 (defun ys-buf-push (ys c)
+  (declare (type character c) (optimize (speed 3) (safety 1)))
   (vector-push-extend c (ys-buf ys)))
+
+(defun ys-buf-nspaces (ys n)
+  (declare (type fixnum n) (optimize (speed 3) (safety 1)))
+  (dotimes (i n)
+    (vector-push-extend #\Space (ys-buf ys))))
+
+(defun ys-buf-append (ys text start end)
+  (declare (type simple-string text) (type fixnum start end)
+           (optimize (speed 3) (safety 1)))
+  (let* ((buf (ys-buf ys))
+         (n (the fixnum (- end start)))
+         (fp (fill-pointer buf))
+         (need (the fixnum (+ fp n)))
+         (dim (array-dimension buf 0)))
+    (declare (type fixnum fp need dim))
+    (when (> need dim)
+      (adjust-array buf (max need (the fixnum (* 2 dim)))))
+    (setf (fill-pointer buf) need)
+    (replace buf text :start1 fp :start2 start :end2 end)))
 
 (defun ys-buf-take (ys)
   (let* ((buf (ys-buf ys))
@@ -128,23 +135,27 @@
           (gethash "!!" ht) "tag:yaml.org,2002:")))
 
 (declaim (inline ys-eof-p ys-peek ys-next ys-column ys-goto ys-backup
-                 s-space-p s-tab-p s-white-p b-break-p ns-char-p))
+                 s-space-p s-tab-p s-white-p b-break-p ns-char-p
+                 c-flow-indicator-p))
 
 (defun ys-eof-p (ys)
+  (declare (type ys ys) (optimize (speed 3) (safety 1)))
   (>= (ys-pos ys) (ys-len ys)))
 
 (defun ys-peek (ys &optional (n 0))
-  (declare (type ys ys) (type fixnum n))
+  (declare (type ys ys) (type fixnum n)
+           (optimize (speed 3) (safety 1)))
   (let ((i (the fixnum (+ (ys-pos ys) n))))
     (when (< i (ys-len ys))
-      (char (ys-text ys) i))))
+      (schar (ys-text ys) i))))
 
 (defun ys-next (ys)
   "libyaml SKIP: advance index; column++ unless the char is LF (column = 0)."
-  (declare (type ys ys))
+  (declare (type ys ys) (optimize (speed 3) (safety 1)))
   (let ((pos (ys-pos ys)))
+    (declare (type fixnum pos))
     (when (< pos (ys-len ys))
-      (let ((c (char (ys-text ys) pos)))
+      (let ((c (schar (ys-text ys) pos)))
         (setf (ys-pos ys) (the fixnum (1+ pos)))
         (if (char= c #\Newline)
             (setf (ys-col ys) 0)
@@ -156,7 +167,8 @@
 
 (defun ys-goto (ys pos col)
   "Restore a saved mark (libyaml marks stack / simple-key rewind)."
-  (declare (type ys ys) (type fixnum pos col))
+  (declare (type ys ys) (type fixnum pos col)
+           (optimize (speed 3) (safety 1)))
   (setf (ys-pos ys) pos
         (ys-col ys) col)
   pos)
@@ -167,41 +179,60 @@
   (decf (ys-pos ys) n)
   (decf (ys-col ys) n))
 
-(defun emit (ys kind &key (implicit t) flow-p anchor tag style value)
-  (let ((anchor (and anchor (plusp (length anchor)) anchor)))
-    (if (ys-sink ys)
-        (funcall (ys-sink ys) kind
-                 :implicit implicit :flow-p flow-p
-                 :anchor anchor :tag tag :style (or style :plain) :value value)
+(defun %emit (ys kind implicit flow-p anchor tag style value)
+  "Positional emit. LIVE compose calls live-on-event directly — no
+   funcall/apply/&key. Lookaheads nil ys-live and scratch the event vector."
+  (declare (type ys ys) (optimize (speed 3) (safety 1)))
+  (let ((anchor (and anchor (plusp (length anchor)) anchor))
+        (style (or style :plain))
+        (live (ys-live ys)))
+    (if live
+        (live-on-event live kind implicit flow-p anchor tag style value)
         (vector-push-extend
-         (make-yaml-event :kind kind :implicit implicit :flow-p flow-p
-                          :anchor anchor :tag tag :style (or style :plain)
-                          :value value)
+         (%yaml-event kind implicit flow-p anchor tag style value)
          (ys-events ys)))))
 
+(defun emit (ys kind &key (implicit t) flow-p anchor tag style value)
+  (%emit ys kind implicit flow-p anchor tag style value))
+
+(define-compiler-macro emit (&whole form ys kind &rest args)
+  (if (and (evenp (length args))
+           (loop for k in args by #'cddr always (keywordp k)))
+      (let ((implicit t) (flow-p nil) (anchor nil) (tag nil)
+            (style :plain) (value nil))
+        (loop for (k v) on args by #'cddr
+              do (ecase k
+                   (:implicit (setf implicit v))
+                   (:flow-p (setf flow-p v))
+                   (:anchor (setf anchor v))
+                   (:tag (setf tag v))
+                   (:style (setf style v))
+                   (:value (setf value v))))
+        `(%emit ,ys ,kind ,implicit ,flow-p ,anchor ,tag ,style ,value))
+      form))
+
 (defmacro with-ys-checkpoint ((ys) &body body)
-  "Restore mark, event fp, buf fp. Nil the sink so lookahead cannot
+  "Restore mark, event fp, buf fp. Nil ys-live so lookahead cannot
    mutate a live compose tree — scratch events instead."
   (let ((pos (gensym "POS"))
         (col (gensym "COL"))
         (fp (gensym "FP"))
-        (sink (gensym "SINK"))
+        (live (gensym "LIVE"))
         (buf-fp (gensym "BUF-FP"))
         (s (gensym "YS")))
     `(let* ((,s ,ys)
             (,pos (ys-pos ,s))
             (,col (ys-col ,s))
             (,fp (fill-pointer (ys-events ,s)))
-            (,sink (ys-sink ,s))
+            (,live (ys-live ,s))
             (,buf-fp (fill-pointer (ys-buf ,s))))
-       (setf (ys-sink ,s) nil)
+       (setf (ys-live ,s) nil)
        (unwind-protect (progn ,@body)
          (setf (ys-pos ,s) ,pos
                (ys-col ,s) ,col
                (fill-pointer (ys-events ,s)) ,fp
-               (ys-sink ,s) ,sink
+               (ys-live ,s) ,live
                (fill-pointer (ys-buf ,s)) ,buf-fp)))))
-
 (defun fail-parse (ys fmt &rest args)
   (error 'yaml-parse-error
          :message (format nil "~A (pos ~D)"
@@ -212,22 +243,27 @@
 
 (defun s-space-p (c)
   "[31] s-space ::= #x20"
+  (declare (optimize (speed 3) (safety 1)))
   (eql c #\Space))
 
 (defun s-tab-p (c)
   "[32] s-tab ::= #x9"
+  (declare (optimize (speed 3) (safety 1)))
   (eql c #\Tab))
 
 (defun s-white-p (c)
   "[33] s-white ::= s-space | s-tab"
+  (declare (optimize (speed 3) (safety 1)))
   (or (eql c #\Space) (eql c #\Tab)))
 
 (defun b-break-p (c)
   "[28] b-break — CR | LF; CRLF is consumed in [29] b-as-line-feed"
+  (declare (optimize (speed 3) (safety 1)))
   (or (eql c #\Newline) (eql c #\Return)))
 
 (defun ns-char-p (c)
   "[34] ns-char ::= nb-char - s-white"
+  (declare (optimize (speed 3) (safety 1)))
   (and c (not (s-white-p c)) (not (b-break-p c))))
 
 (defun ns-dec-digit-p (c)
@@ -240,12 +276,18 @@
 
 (defun c-indicator-p (c)
   "[22] c-indicator"
-  (member c '(#\- #\? #\: #\, #\[ #\] #\{ #\} #\# #\& #\* #\!
-              #\| #\> #\' #\" #\% #\@ #\`)))
+  (declare (optimize (speed 3) (safety 1)))
+  (and c (or (char= c #\-) (char= c #\?) (char= c #\:) (char= c #\,)
+             (char= c #\[) (char= c #\]) (char= c #\{) (char= c #\})
+             (char= c #\#) (char= c #\&) (char= c #\*) (char= c #\!)
+             (char= c #\|) (char= c #\>) (char= c #\') (char= c #\")
+             (char= c #\%) (char= c #\@) (char= c #\`))))
 
 (defun c-flow-indicator-p (c)
   "[23] c-flow-indicator ::= ',' | '[' | ']' | '{' | '}'"
-  (member c '(#\, #\[ #\] #\{ #\})))
+  (declare (optimize (speed 3) (safety 1)))
+  (and c (or (char= c #\,) (char= c #\[) (char= c #\])
+             (char= c #\{) (char= c #\}))))
 
 ;;;; ch. 6 Structural Characters — indentation, separation, comments
 
@@ -274,7 +316,7 @@
   "[75] c-nb-comment-text starts with `#` only after s-white or b-char (9JBA)."
   (and (eql (ys-peek ys) #\#)
        (or (zerop (ys-pos ys))
-           (let ((prev (char (ys-text ys) (1- (ys-pos ys)))))
+           (let ((prev (schar (ys-text ys) (1- (ys-pos ys)))))
              (or (s-white-p prev) (b-break-p prev))))))
 
 (defun c-nb-comment-text (ys)
@@ -316,7 +358,7 @@
 
 (defun at-bol-p (ys)
   (or (zerop (ys-pos ys))
-      (let ((c (char (ys-text ys) (1- (ys-pos ys)))))
+      (let ((c (schar (ys-text ys) (1- (ys-pos ys)))))
         (or (char= c #\Newline) (char= c #\Return)))))
 
 (defun c-forbidden-p (ys)
@@ -720,11 +762,11 @@
              (if folded
                  (and chars (s-white-p (car chars)))
                  (and (> (ys-pos ys) start)
-                      (s-white-p (char (ys-text ys) (1- (ys-pos ys)))))))
+                      (s-white-p (schar (ys-text ys) (1- (ys-pos ys)))))))
            (ensure-folded-chars ()
              (unless folded
                (loop for i from start below (ys-pos ys)
-                     do (push (char (ys-text ys) i) chars))
+                     do (push (schar (ys-text ys) i) chars))
                (setf folded t))))
       (loop
         (let ((c (ys-peek ys)))
@@ -825,10 +867,40 @@
     (let ((header-break (b-as-line-feed ys)))
       (values chomp explicit-indent header-break))))
 
+(defun %apply-chomp-buf (ys chomp header-break)
+  "[163]–[167] c-chomping-indicator / l-chomped-empty.
+   Empty keep keeps the header break when it exists (K858 vs 2G84/03)."
+  (let ((buf (ys-buf ys)))
+    (flet ((strip-nl ()
+             (loop while (and (plusp (fill-pointer buf))
+                              (char= (char buf (1- (fill-pointer buf))) #\Newline))
+                   do (decf (fill-pointer buf)))))
+      (ecase chomp
+        (:keep
+         (cond
+           ((zerop (fill-pointer buf))
+            (if header-break (string #\Newline) ""))
+           ((char= (char buf (1- (fill-pointer buf))) #\Newline)
+            (ys-buf-take ys))
+           (t
+            (ys-buf-push ys #\Newline)
+            (ys-buf-take ys))))
+        (:strip
+         (strip-nl)
+         (ys-buf-take ys))
+        (:clip
+         (strip-nl)
+         (if (zerop (fill-pointer buf))
+             ""
+             (progn
+               (ys-buf-push ys #\Newline)
+               (ys-buf-take ys))))))))
+
 (defun l+block-scalar (ys &key (indent -1))
   "[170]/[174] c-l+literal / c-l+folded. Parent n may be -1 (l-bare-document).
    Tab after s-indent is nb-char content (96NN), not s-indent.
-   `#` at content-indent is content (DK3J). [206] c-forbidden ends the scalar."
+   `#` at content-indent is content (DK3J). [206] c-forbidden ends the scalar.
+   Writes into ys-buf (no per-line concatenate)."
   (let ((kind (ys-next ys)))
     (unless (or (char= kind #\|) (char= kind #\>))
       (fail-parse ys "expected block scalar"))
@@ -837,124 +909,94 @@
       (let* ((parent indent)
              (content-indent (and explicit-indent (+ (max parent 0) explicit-indent)))
              (max-empty 0)
-             (lines '()))
-        (loop
-          (when (ys-eof-p ys)
-            (return))
-          (when (c-forbidden-p ys)
-            (return))
-          (let ((col 0))
-            (loop while (s-space-p (ys-peek ys))
-                  do (ys-next ys) (incf col))
-            (cond
-              ((and (eql (ys-peek ys) #\Tab)
-                    (if content-indent
-                        (< col content-indent)
-                        (<= col parent)))
-               (fail-parse ys "tab used as indentation"))
-              ((or (ys-eof-p ys) (b-break-p (ys-peek ys)))
-               (cond
-                 ((and content-indent (> col content-indent))
-                  (push (make-string (- col content-indent) :initial-element #\Space)
-                        lines))
-                 (t
-                  (setf max-empty (max max-empty col))
-                  (push "" lines)))
-               (b-as-line-feed ys))
-              ((and content-indent (< col content-indent)
-                    (eql (ys-peek ys) #\#))
-               (return))
-              (t
-               (unless content-indent
-                 (when (<= col parent)
+             (literal (char= kind #\|))
+             (prev-empty t)
+             (prev-more nil)
+             (blank-after-more nil)
+             (first t))
+        (ys-buf-clear ys)
+        (flet ((fold-empty ()
+                 (ys-buf-push ys #\Newline)
+                 (when prev-more (setf blank-after-more t))
+                 (setf prev-empty t prev-more nil))
+               (fold-more (extra start end)
+                 (unless first
+                   (ys-buf-push ys #\Newline))
+                 (ys-buf-nspaces ys extra)
+                 (ys-buf-append ys (ys-text ys) start end)
+                 (setf prev-empty nil first nil prev-more t blank-after-more nil))
+               (fold-plain (start end)
+                 (unless first
+                   (cond
+                     (blank-after-more (ys-buf-push ys #\Newline))
+                     (prev-empty)
+                     (prev-more (ys-buf-push ys #\Newline))
+                     (t (ys-buf-push ys #\Space))))
+                 (ys-buf-append ys (ys-text ys) start end)
+                 (setf prev-empty nil first nil prev-more nil blank-after-more nil)))
+          (loop
+            (when (ys-eof-p ys)
+              (return))
+            (when (c-forbidden-p ys)
+              (return))
+            (let ((col 0))
+              (loop while (s-space-p (ys-peek ys))
+                    do (ys-next ys) (incf col))
+              (cond
+                ((and (eql (ys-peek ys) #\Tab)
+                      (if content-indent
+                          (< col content-indent)
+                          (<= col parent)))
+                 (fail-parse ys "tab used as indentation"))
+                ((or (ys-eof-p ys) (b-break-p (ys-peek ys)))
+                 (cond
+                   ((and content-indent (> col content-indent))
+                    (let ((extra (- col content-indent)))
+                      (if literal
+                          (progn
+                            (ys-buf-nspaces ys extra)
+                            (ys-buf-push ys #\Newline))
+                          (fold-more extra 0 0))))
+                   (t
+                    (setf max-empty (max max-empty col))
+                    (if literal
+                        (ys-buf-push ys #\Newline)
+                        (fold-empty))))
+                 (b-as-line-feed ys))
+                ((and content-indent (< col content-indent)
+                      (eql (ys-peek ys) #\#))
+                 (return))
+                (t
+                 (unless content-indent
+                   (when (<= col parent)
+                     (ys-backup ys col)
+                     (return))
+                   (when (and (plusp max-empty) (< col max-empty))
+                     (fail-parse ys "block scalar content indented less than preceding empty line"))
+                   (setf content-indent col))
+                 (when (< col content-indent)
                    (ys-backup ys col)
                    (return))
-                 (when (and (plusp max-empty) (< col max-empty))
-                   (fail-parse ys "block scalar content indented less than preceding empty line"))
-                 (setf content-indent col))
-               (when (< col content-indent)
-                 (ys-backup ys col)
-                 (return))
-               (let ((extra (- col content-indent)))
-                 (push (concatenate 'string
-                                    (make-string extra :initial-element #\Space)
-                                    (with-output-to-string (o)
-                                      (loop until (or (ys-eof-p ys)
-                                                      (b-break-p (ys-peek ys)))
-                                            do (write-char (ys-next ys) o))))
-                       lines)
-                 (b-as-line-feed ys))))))
-        (setf lines (nreverse lines))
-        (let ((text (if (char= kind #\|)
-                        (%join-literal lines)
-                        (%join-folded lines))))
-          (values (%apply-chomp text chomp :header-break header-break)
-                  (if (char= kind #\|) :literal :folded)))))))
-
-(defun %join-literal (lines)
-  "[171] l-nb-literal-text — newline after every source line, then [165] chomp."
-  (if (null lines)
-      ""
-      (with-output-to-string (o)
-        (dolist (line lines)
-          (write-string line o)
-          (write-char #\Newline o)))))
-
-(defun %join-folded (lines)
-  "[176] l-nb-diff-lines / [172]–[175]. Extra blank after more-indent only
-   when the next non-empty line is folded, not more-indented (7T8X vs 6VJK)."
-  (with-output-to-string (out)
-    (let ((prev-empty t)
-          (prev-more nil)
-          (blank-after-more nil)
-          (first t))
-      (dolist (line lines)
-        (let ((empty (zerop (length line)))
-              (more (and (plusp (length line))
-                         (s-white-p (char line 0)))))
-          (cond
-            (empty
-             (write-char #\Newline out)
-             (when prev-more
-               (setf blank-after-more t))
-             (setf prev-empty t prev-more nil))
-            (more
-             (unless first
-               (write-char #\Newline out))
-             (write-string line out)
-             (setf prev-empty nil first nil prev-more t blank-after-more nil))
-            (t
-             (unless first
-               (cond
-                 (blank-after-more (write-char #\Newline out))
-                 (prev-empty)
-                 (prev-more (write-char #\Newline out))
-                 (t (write-char #\Space out))))
-             (write-string line out)
-             (setf prev-empty nil first nil prev-more nil blank-after-more nil))))))))
-
-(defun %apply-chomp (text chomp &key header-break)
-  "[163]–[167] c-chomping-indicator / l-chomped-empty.
-   Empty keep keeps the header break when it exists (K858 vs 2G84/03)."
-  (flet ((strip-nl (s)
-           (let ((end (length s)))
-             (loop while (and (plusp end) (char= (char s (1- end)) #\Newline))
-                   do (decf end))
-             (subseq s 0 end))))
-    (ecase chomp
-      (:keep
-       (cond
-         ((zerop (length text))
-          (if header-break (string #\Newline) ""))
-         ((char= (char text (1- (length text))) #\Newline) text)
-         (t (concatenate 'string text (string #\Newline)))))
-      (:strip (strip-nl text))
-      (:clip
-       (let ((stripped (strip-nl text)))
-         (if (zerop (length stripped))
-             ""
-             (concatenate 'string stripped (string #\Newline))))))))
-
+                 (let* ((extra (- col content-indent))
+                        (start (ys-pos ys)))
+                   (loop until (or (ys-eof-p ys) (b-break-p (ys-peek ys)))
+                         do (ys-next ys))
+                   (let ((end (ys-pos ys))
+                         (more (or (plusp extra)
+                                   (and (< start (ys-pos ys))
+                                        (s-white-p (schar (ys-text ys) start))))))
+                     (cond
+                       (literal
+                        (ys-buf-nspaces ys extra)
+                        (ys-buf-append ys (ys-text ys) start end)
+                        (ys-buf-push ys #\Newline))
+                       (more
+                        (fold-more extra start end))
+                       (t
+                        (fold-plain start end))))
+                   (b-as-line-feed ys))))))
+          (values (%apply-chomp-buf ys chomp header-break)
+                  (if literal :literal :folded)))))))
 (defun c-sequence-entry-p (ys)
   "[4] c-sequence-entry `-` as [184] c-l-block-seq-entry (followed by s-white / b-break / '#')."
   (and (eql (ys-peek ys) #\-)
@@ -991,7 +1033,7 @@
                (yaml-parse-error ()
                  (return-from ns-s-block-map-implicit-key-p nil)))
              (when (loop for i from start below (ys-pos ys)
-                         thereis (b-break-p (char (ys-text ys) i)))
+                         thereis (b-break-p (schar (ys-text ys) i)))
                (return-from ns-s-block-map-implicit-key-p nil))))
           ((eql (ys-peek ys) #\{)
            (let ((start (ys-pos ys)))
@@ -999,7 +1041,7 @@
                (yaml-parse-error ()
                  (return-from ns-s-block-map-implicit-key-p nil)))
              (when (loop for i from start below (ys-pos ys)
-                         thereis (b-break-p (char (ys-text ys) i)))
+                         thereis (b-break-p (schar (ys-text ys) i)))
                (return-from ns-s-block-map-implicit-key-p nil))))
           (t
            (loop
@@ -1009,7 +1051,7 @@
                   (return))
                  ((and (eql c #\#)
                        (or (zerop (ys-pos ys))
-                           (s-white-p (char (ys-text ys) (1- (ys-pos ys))))))
+                           (s-white-p (schar (ys-text ys) (1- (ys-pos ys))))))
                   (return))
                  ((and (eql c #\:) (colon-ends-plain-p ys nil))
                   (return))
@@ -1070,11 +1112,13 @@
 
 (defun colon-after-break-p (ys)
   "True when `:` is the first non-white on its line (DK4H)."
+  (declare (optimize (speed 3) (safety 1)))
   (let ((text (ys-text ys))
         (i (1- (ys-pos ys))))
-    (loop while (and (>= i 0) (s-white-p (char text i)))
+    (declare (type simple-string text) (type fixnum i))
+    (loop while (and (>= i 0) (s-white-p (schar text i)))
           do (decf i))
-    (or (minusp i) (b-break-p (char text i)))))
+    (or (minusp i) (b-break-p (schar text i)))))
 
 (defun e-node (ys &key anchor tag)
   "[105] e-scalar / [106] e-node"
@@ -1656,7 +1700,8 @@
         (setf need-suffix (eq kind t))))))
 
 (defun %json-ws (text i)
-  (declare (type string text) (type fixnum i))
+  (declare (type string text) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
   (let ((n (length text)))
     (loop while (and (< i n)
                      (let ((c (char text i)))
@@ -1887,8 +1932,7 @@
         (live (make-live-composer)))
     (unwind-protect
          (progn
-           (setf (ys-sink ys) (lambda (kind &rest keys)
-                                (apply #'live-on-event live kind keys)))
+           (setf (ys-live ys) live)
            (c-byte-order-mark ys)
            (reset-tag-handles ys)
            (emit ys :stream-start)
