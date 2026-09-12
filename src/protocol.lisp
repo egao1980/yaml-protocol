@@ -72,7 +72,7 @@
                   collect v)))))
 
 (defun parse-events (source)
-  "Parse SOURCE to packed YAML-EVENTS (stride 7). Box with BOX-EVENTS.")
+  "Parse SOURCE to packed YAML-EVENTS (stride 7). Box with BOX-EVENTS."
   (unless *yaml-backend*
     (error 'yaml-parse-error :message "*yaml-backend* is unbound — load yaml-protocol"))
   (handler-case
