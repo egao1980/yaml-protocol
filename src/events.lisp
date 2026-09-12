@@ -127,17 +127,26 @@
 
 (defun resolve-plain (s)
   "YAML 1.2 Core schema on a plain scalar (not 1.1 — NO is a string)."
-  (cond
-    ((or (string= s "")
-         (string= s "~")
-         (string= s "null") (string= s "Null") (string= s "NULL"))
-     :null)
-    ((or (string= s "true") (string= s "True") (string= s "TRUE")) t)
-    ((or (string= s "false") (string= s "False") (string= s "FALSE")) nil)
-    (t
-     (or (%core-integer s)
-         (%core-float s)
-         s))))
+  (declare (type string s) (optimize (speed 3) (safety 1)))
+  (let ((n (length s)))
+    (declare (type fixnum n))
+    (when (zerop n)
+      (return-from resolve-plain :null))
+    (let ((c (char s 0)))
+      (cond
+        ((or (char<= #\0 c #\9) (char= c #\+) (char= c #\-) (char= c #\.))
+         (or (%core-integer s) (%core-float s) s))
+        ((or (char= c #\~)
+             (and (= n 4) (or (string= s "null") (string= s "Null")
+                              (string= s "NULL") (string= s "true")
+                              (string= s "True") (string= s "TRUE"))))
+         (if (or (char= c #\~) (char= c #\n) (char= c #\N))
+             :null
+             t))
+        ((and (= n 5) (or (string= s "false") (string= s "False")
+                          (string= s "FALSE")))
+         nil)
+        (t s)))))
 
 (defun %event-escape (s)
   (with-output-to-string (o)
@@ -371,10 +380,12 @@
   (stack nil)
   (anchors nil)
   (docs nil)
-  (root :empty))
+  (root :empty)
+  (hint 16 :type fixnum))
 
-(defun make-live-composer ()
-  (%make-live-composer :anchors (make-hash-table :test #'equal)))
+(defun make-live-composer (&optional (hint 16))
+  (%make-live-composer :anchors (make-hash-table :test #'equal :size 8)
+                       :hint (max 8 hint)))
 
 (declaim (inline live-bind live-place))
 
@@ -403,52 +414,70 @@
                    (lframe-pending-key frame) nil))))))
   object)
 
-(defun live-on-event (live kind implicit flow-p anchor tag style value)
-  (declare (ignore implicit flow-p)
-           (optimize (speed 3) (safety 1)))
-  (ecase kind
+(defun live-doc-start (live)
+  (clrhash (live-composer-anchors live))
+  (setf (live-composer-root live) :empty
+        (live-composer-stack live) nil))
+
+(defun live-doc-end (live)
+  (when (live-composer-stack live)
+    (error 'yaml-parse-error :message "unclosed collection at document end"))
+  (push (if (eq (live-composer-root live) :empty)
+            :null
+            (live-composer-root live))
+        (live-composer-docs live))
+  (setf (live-composer-root live) :empty))
+
+(defun live-scalar (live value anchor tag style)
+  (live-place live (live-bind live (%resolve-scalar-raw value tag style) anchor)))
+
+(defun live-alias (live name)
+  (let ((val (gethash name (live-composer-anchors live) :missing)))
+    (when (eq val :missing)
+      (error 'yaml-parse-error
+             :message (format nil "unknown alias *~A" name)))
+    (live-place live val)))
+
+(defun live-seq-start (live anchor)
+  (let ((items (make-array (live-composer-hint live)
+                           :adjustable t :fill-pointer 0)))
+    (live-bind live items anchor)
+    (live-place live items)
+    (push (%lframe :seq items) (live-composer-stack live))))
+
+(defun live-seq-end (live)
+  (let ((frame (car (live-composer-stack live))))
+    (unless (and frame (eq (lframe-kind frame) :seq))
+      (error 'yaml-parse-error :message "unexpected -SEQ"))
+    (pop (live-composer-stack live))))
+
+(defun live-map-start (live anchor)
+  (let ((ht (make-hash-table :test #'equal :size (live-composer-hint live))))
+    (live-bind live ht anchor)
+    (live-place live ht)
+    (push (%lframe :map ht) (live-composer-stack live))))
+
+(defun live-map-end (live)
+  (let ((frame (car (live-composer-stack live))))
+    (unless (and frame (eq (lframe-kind frame) :map))
+      (error 'yaml-parse-error :message "unexpected -MAP"))
+    (pop (live-composer-stack live))))
+
+(defun live-emit (live kind anchor tag style value)
+  (declare (optimize (speed 3) (safety 1)))
+  (case kind
     (:stream-start)
     (:stream-end)
-    (:document-start
-     (setf (live-composer-anchors live) (make-hash-table :test #'equal)
-           (live-composer-root live) :empty
-           (live-composer-stack live) nil))
-    (:document-end
-     (when (live-composer-stack live)
-       (error 'yaml-parse-error :message "unclosed collection at document end"))
-     (push (if (eq (live-composer-root live) :empty)
-               :null
-               (live-composer-root live))
-           (live-composer-docs live))
-     (setf (live-composer-root live) :empty))
-    (:scalar
-     (live-place live (live-bind live (%resolve-scalar-raw value tag style) anchor)))
-    (:alias
-     (let ((val (gethash value (live-composer-anchors live) :missing)))
-       (when (eq val :missing)
-         (error 'yaml-parse-error
-                :message (format nil "unknown alias *~A" value)))
-       (live-place live val)))
-    (:sequence-start
-     (let ((items (make-array 8 :adjustable t :fill-pointer 0)))
-       (live-bind live items anchor)
-       (live-place live items)
-       (push (%lframe :seq items) (live-composer-stack live))))
-    (:sequence-end
-     (let ((frame (car (live-composer-stack live))))
-       (unless (and frame (eq (lframe-kind frame) :seq))
-         (error 'yaml-parse-error :message "unexpected -SEQ"))
-       (pop (live-composer-stack live))))
-    (:mapping-start
-     (let ((ht (make-hash-table :test #'equal)))
-       (live-bind live ht anchor)
-       (live-place live ht)
-       (push (%lframe :map ht) (live-composer-stack live))))
-    (:mapping-end
-     (let ((frame (car (live-composer-stack live))))
-       (unless (and frame (eq (lframe-kind frame) :map))
-         (error 'yaml-parse-error :message "unexpected -MAP"))
-       (pop (live-composer-stack live))))))
+    (:document-start (live-doc-start live))
+    (:document-end (live-doc-end live))
+    (:scalar (live-scalar live value anchor tag style))
+    (:alias (live-alias live value))
+    (:sequence-start (live-seq-start live anchor))
+    (:sequence-end (live-seq-end live))
+    (:mapping-start (live-map-start live anchor))
+    (:mapping-end (live-map-end live))
+    (t (error 'yaml-parse-error
+              :message (format nil "unexpected event ~A" kind)))))
 
 (defun live-result (live &key all)
   (let ((docs (nreverse (live-composer-docs live))))

@@ -38,7 +38,7 @@
 (defun make-ys (text)
   (let ((text (%simple-text text)))
     (%make-ys :text text :pos 0 :col 0 :len (length text)
-              :events (make-array 64 :adjustable t :fill-pointer 0)
+              :events (make-array 448 :adjustable t :fill-pointer 0)
               :buf (make-array 256 :element-type 'character
                                :adjustable t :fill-pointer 0)
               :tag-handles (make-hash-table :test #'equal))))
@@ -74,13 +74,26 @@
   (setf *ys-cache* ys)
   nil)
 
+(defconstant +ev-stride+ 7)
+
 (defun take-events (ys)
-  "Copy out a right-sized vector. Keep the reserved buffer on YS for reuse."
-  (let* ((ev (ys-events ys))
-         (n (fill-pointer ev))
-         (out (make-array n)))
-    (replace out ev :end1 n :end2 n)
-    (setf (fill-pointer ev) 0)
+  "Materialize packed slots into YAML-EVENT objects. Buffer stays on YS."
+  (let* ((evs (ys-events ys))
+         (n (fill-pointer evs))
+         (count (truncate n +ev-stride+))
+         (out (make-array count)))
+    (declare (type fixnum n count))
+    (loop for i from 0 below count
+          for b of-type fixnum = (* i +ev-stride+)
+          do (setf (aref out i)
+                   (%yaml-event (aref evs b)
+                                (aref evs (the fixnum (+ b 1)))
+                                (aref evs (the fixnum (+ b 2)))
+                                (aref evs (the fixnum (+ b 3)))
+                                (aref evs (the fixnum (+ b 4)))
+                                (aref evs (the fixnum (+ b 5)))
+                                (aref evs (the fixnum (+ b 6))))))
+    (setf (fill-pointer evs) 0)
     out))
 
 (declaim (inline ys-buf-clear ys-buf-push ys-buf-take ys-buf-nspaces ys-buf-append))
@@ -185,19 +198,35 @@
   (decf (ys-pos ys) n)
   (decf (ys-col ys) n))
 
-(defun emit-event (ys kind implicit flow-p anchor tag style value)
-  "Positional emit. LIVE compose calls live-on-event directly — no
-   funcall/apply/&key. Lookaheads nil ys-live and scratch the event vector."
+(defun emit-packed (ys kind implicit flow-p anchor tag style value)
+  "SoA-style: 7 slots per event in ys-events. No yaml-event until take-events."
   (declare (type ys ys) (optimize (speed 3) (safety 1)))
-  (let ((anchor (and anchor (plusp (length anchor)) anchor))
+  (let* ((evs (ys-events ys))
+         (fp (fill-pointer evs))
+         (need (the fixnum (+ fp +ev-stride+)))
+         (dim (array-dimension evs 0)))
+    (declare (type fixnum fp need dim))
+    (when (> need dim)
+      (adjust-array evs (max need (the fixnum (* 2 dim)))))
+    (setf (aref evs fp) kind
+          (aref evs (the fixnum (1+ fp))) implicit
+          (aref evs (the fixnum (+ fp 2))) flow-p
+          (aref evs (the fixnum (+ fp 3))) anchor
+          (aref evs (the fixnum (+ fp 4))) tag
+          (aref evs (the fixnum (+ fp 5))) style
+          (aref evs (the fixnum (+ fp 6))) value
+          (fill-pointer evs) need)))
+
+(defun emit-event (ys kind implicit flow-p anchor tag style value)
+  "Positional emit. Live compose never builds events. parse-events packs
+   slots and materializes yaml-event only in take-events."
+  (declare (type ys ys) (optimize (speed 3) (safety 1)))
+  (let ((anchor (and (stringp anchor) (plusp (length anchor)) anchor))
         (style (or style :plain))
         (live (ys-live ys)))
     (if live
-        (live-on-event live kind implicit flow-p anchor tag style value)
-        (vector-push-extend
-         (%yaml-event kind implicit flow-p anchor tag style value)
-         (ys-events ys)))))
-
+        (live-emit live kind anchor tag style value)
+        (emit-packed ys kind implicit flow-p anchor tag style value))))
 (defun emit (ys kind &key (implicit t) flow-p anchor tag style value)
   (emit-event ys kind implicit flow-p anchor tag style value))
 
@@ -1937,7 +1966,8 @@
 
 (defun parse-yaml-live (text &key all)
   (let ((ys (acquire-ys (or text "")))
-        (live (make-live-composer)))
+        (live (make-live-composer
+                (min 4096 (max 16 (ash (length text) -3))))))
     (unwind-protect
          (progn
            (setf (ys-live ys) live)
