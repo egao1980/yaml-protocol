@@ -179,7 +179,7 @@
   (decf (ys-pos ys) n)
   (decf (ys-col ys) n))
 
-(defun %emit (ys kind implicit flow-p anchor tag style value)
+(defun emit-event (ys kind implicit flow-p anchor tag style value)
   "Positional emit. LIVE compose calls live-on-event directly — no
    funcall/apply/&key. Lookaheads nil ys-live and scratch the event vector."
   (declare (type ys ys) (optimize (speed 3) (safety 1)))
@@ -193,7 +193,7 @@
          (ys-events ys)))))
 
 (defun emit (ys kind &key (implicit t) flow-p anchor tag style value)
-  (%emit ys kind implicit flow-p anchor tag style value))
+  (emit-event ys kind implicit flow-p anchor tag style value))
 
 (define-compiler-macro emit (&whole form ys kind &rest args)
   (if (and (evenp (length args))
@@ -208,7 +208,7 @@
                    (:tag (setf tag v))
                    (:style (setf style v))
                    (:value (setf value v))))
-        `(%emit ,ys ,kind ,implicit ,flow-p ,anchor ,tag ,style ,value))
+        `(emit-event ,ys ,kind ,implicit ,flow-p ,anchor ,tag ,style ,value))
       form))
 
 (defmacro with-ys-checkpoint ((ys) &body body)
