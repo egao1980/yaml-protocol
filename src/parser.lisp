@@ -24,14 +24,100 @@
   (col 0 :type fixnum)
   (len 0 :type fixnum)
   (events nil)
+  (buf nil)
+  (sink nil)
   (tag-handles nil)
   (parent-indent -1 :type fixnum)
   (yaml-directive-p nil))
 
+(defun estimate-event-capacity (text)
+  "ryml estimate_tree_capacity: \\n , [ { plus YAML - :."
+  (declare (type string text))
+  (let ((n 8))
+    (loop for c across text
+          when (or (char= c #\Newline) (char= c #\,)
+                   (char= c #\[) (char= c #\{)
+                   (char= c #\-) (char= c #\:))
+            do (incf n))
+    (max 32 n)))
+
 (defun make-ys (text)
-  (%make-ys :text text :pos 0 :col 0 :len (length text)
-            :events (make-array 32 :adjustable t :fill-pointer 0)
-            :tag-handles (make-hash-table :test #'equal)))
+  (let ((text (or text "")))
+    (%make-ys :text text :pos 0 :col 0 :len (length text)
+              :events (make-array (estimate-event-capacity text)
+                                  :adjustable t :fill-pointer 0)
+              :buf (make-array 64 :element-type 'character
+                               :adjustable t :fill-pointer 0)
+              :tag-handles (make-hash-table :test #'equal))))
+
+(defvar *ys-cache* nil)
+
+(defun reset-ys (ys text)
+  (let* ((text (or text ""))
+         (n (estimate-event-capacity text))
+         (ev (ys-events ys)))
+    (setf (ys-text ys) text
+          (ys-pos ys) 0
+          (ys-col ys) 0
+          (ys-len ys) (length text)
+          (ys-parent-indent ys) -1
+          (ys-sink ys) nil)
+    (setf (fill-pointer ev) 0)
+    (when (< (array-dimension ev 0) n)
+      (adjust-array ev n))
+    (setf (fill-pointer (ys-buf ys)) 0)
+    (reset-tag-handles ys)
+    ys))
+
+(defun acquire-ys (text)
+  (let ((ys *ys-cache*))
+    (if ys
+        (progn
+          (setf *ys-cache* nil)
+          (reset-ys ys text))
+        (make-ys text))))
+
+(defun release-ys (ys)
+  (setf (ys-text ys) ""
+        (ys-len ys) 0
+        (ys-sink ys) nil
+        (fill-pointer (ys-events ys)) 0
+        (fill-pointer (ys-buf ys)) 0)
+  (setf *ys-cache* ys)
+  nil)
+
+(defun take-events (ys)
+  "Caller owns the event vector. Pooling must not reuse it."
+  (let ((ev (ys-events ys)))
+    (setf (ys-events ys)
+          (make-array (max 32 (array-dimension ev 0))
+                      :adjustable t :fill-pointer 0))
+    ev))
+
+(declaim (inline ys-buf-clear ys-buf-push ys-buf-take))
+
+(defun ys-buf-clear (ys)
+  (setf (fill-pointer (ys-buf ys)) 0))
+
+(defun ys-buf-push (ys c)
+  (vector-push-extend c (ys-buf ys)))
+
+(defun ys-buf-take (ys)
+  (let* ((buf (ys-buf ys))
+         (n (fill-pointer buf)))
+    (if (zerop n)
+        ""
+        (subseq buf 0 n))))
+
+(defun %text-slice (text start end)
+  "Displaced slice of TEXT. Empty → \"\" (do not keep the source alive)."
+  (declare (type string text) (type fixnum start end))
+  (if (= start end)
+      ""
+      (make-array (- end start)
+                  :element-type (array-element-type text)
+                  :displaced-to text
+                  :displaced-index-offset start)))
 
 (defun reset-tag-handles (ys)
   (let ((ht (ys-tag-handles ys)))
@@ -81,26 +167,39 @@
   (decf (ys-col ys) n))
 
 (defun emit (ys kind &key (implicit t) flow-p anchor tag style value)
-  (vector-push-extend
-   (make-yaml-event :kind kind :implicit implicit :flow-p flow-p
-                    :anchor (and anchor (plusp (length anchor)) anchor)
-                    :tag tag :style (or style :plain) :value value)
-   (ys-events ys)))
+  (let ((anchor (and anchor (plusp (length anchor)) anchor)))
+    (if (ys-sink ys)
+        (funcall (ys-sink ys) kind
+                 :implicit implicit :flow-p flow-p
+                 :anchor anchor :tag tag :style (or style :plain) :value value)
+        (vector-push-extend
+         (make-yaml-event :kind kind :implicit implicit :flow-p flow-p
+                          :anchor anchor :tag tag :style (or style :plain)
+                          :value value)
+         (ys-events ys)))))
 
 (defmacro with-ys-checkpoint ((ys) &body body)
-  "Restore mark (pos+col) and event fill-pointer after a speculative parse."
+  "Restore mark, event fp, buf fp. Nil the sink so lookahead cannot
+   mutate a live compose tree — scratch events instead."
   (let ((pos (gensym "POS"))
         (col (gensym "COL"))
         (fp (gensym "FP"))
+        (sink (gensym "SINK"))
+        (buf-fp (gensym "BUF-FP"))
         (s (gensym "YS")))
     `(let* ((,s ,ys)
             (,pos (ys-pos ,s))
             (,col (ys-col ,s))
-            (,fp (fill-pointer (ys-events ,s))))
+            (,fp (fill-pointer (ys-events ,s)))
+            (,sink (ys-sink ,s))
+            (,buf-fp (fill-pointer (ys-buf ,s))))
+       (setf (ys-sink ,s) nil)
        (unwind-protect (progn ,@body)
          (setf (ys-pos ,s) ,pos
                (ys-col ,s) ,col
-               (fill-pointer (ys-events ,s)) ,fp)))))
+               (fill-pointer (ys-events ,s)) ,fp
+               (ys-sink ,s) ,sink
+               (fill-pointer (ys-buf ,s)) ,buf-fp)))))
 
 (defun fail-parse (ys fmt &rest args)
   (error 'yaml-parse-error
@@ -493,36 +592,39 @@
       ((s-white-p e) e)                  ; `\` + tab (3RLN/01), not `\.` (55WF)
       (t (fail-parse ys "unknown escape \\~A" e)))))
 
-(defun s-flow-folded (ys chars indent)
-  "[74] s-flow-folded(n). Trailing s-space on the line is discarded; an
-   escaped tab already in CHARS is ns-esc-char, not line s-white (DE56)."
-  (loop while (and chars (s-space-p (car chars)))
-        do (pop chars))
-  (b-as-line-feed ys)
-  (let ((empty 0))
-    (loop
-      (s-indent ys)
-      (when (and (eql (ys-peek ys) #\Tab)
-                 (>= indent 0)
-                 (< (ys-column ys) indent))
-        (fail-parse ys "tab used as indentation"))
+(defun s-flow-folded (ys indent)
+  "[74] s-flow-folded(n). Writes into ys-buf. Trailing s-space on the
+   line is discarded; an escaped tab already in the buf is ns-esc-char,
+   not line s-white (DE56)."
+  (let ((buf (ys-buf ys)))
+    (loop while (and (plusp (fill-pointer buf))
+                     (s-space-p (char buf (1- (fill-pointer buf)))))
+          do (decf (fill-pointer buf)))
+    (b-as-line-feed ys)
+    (let ((empty 0))
+      (loop
+        (s-indent ys)
+        (when (and (eql (ys-peek ys) #\Tab)
+                   (>= indent 0)
+                   (< (ys-column ys) indent))
+          (fail-parse ys "tab used as indentation"))
+        (s-separate-in-line ys)
+        (cond
+          ((b-break-p (ys-peek ys))
+           (b-as-line-feed ys)
+           (incf empty))
+          (t (return))))
       (s-separate-in-line ys)
-      (cond
-        ((b-break-p (ys-peek ys))
-         (b-as-line-feed ys)
-         (incf empty))
-        (t (return))))
-    (s-separate-in-line ys)
-    (let ((c (ys-peek ys)))
-      (when (and (not (null c))
-                 (not (b-break-p c))
-                 (>= indent 0)
-                 (< (ys-column ys) indent))
-        (fail-parse ys "wrong indent in flow/quoted")))
-    (if (plusp empty)
-        (dotimes (i empty chars)
-          (push #\Newline chars))
-        (progn (push #\Space chars) chars))))
+      (let ((c (ys-peek ys)))
+        (when (and (not (null c))
+                   (not (b-break-p c))
+                   (>= indent 0)
+                   (< (ys-column ys) indent))
+          (fail-parse ys "wrong indent in flow/quoted")))
+      (if (plusp empty)
+          (dotimes (i empty)
+            (ys-buf-push ys #\Newline))
+          (ys-buf-push ys #\Space)))))
 
 (defun c-double-quoted (ys &key (indent -1) single-line)
   "[109] c-double-quoted(n,c) / [110] nb-double-text.
@@ -530,11 +632,14 @@
    escaped tabs are already [62] ns-esc-char and stay (DE56/00)."
   (unless (eql (ys-next ys) #\")
     (fail-parse ys "expected \""))
-  (let ((chars '())
-        (pending '()))
+  (ys-buf-clear ys)
+  (let ((pending-fp nil))
     (flet ((flush-pending ()
-             (setf chars (append pending chars)
-                   pending nil)))
+             (setf pending-fp nil))
+           (discard-pending ()
+             (when pending-fp
+               (setf (fill-pointer (ys-buf ys)) pending-fp
+                     pending-fp nil))))
       (loop
         (let ((c (ys-peek ys)))
           (cond
@@ -542,7 +647,7 @@
             ((char= c #\")
              (flush-pending)
              (ys-next ys)
-             (return (coerce (nreverse chars) 'string)))
+             (return (ys-buf-take ys)))
             ((c-forbidden-p ys)
              (fail-parse ys "document marker inside double-quoted scalar"))
             ((char= c #\\)
@@ -554,40 +659,42 @@
                    ;; Leading spaces are prefix (565N); `\`+space after that is content (NP9H).
                    (loop while (s-space-p (ys-peek ys))
                          do (ys-next ys))
-                   (push x chars))))
+                   (ys-buf-push ys x))))
             ((b-break-p c)
              (when single-line
                (fail-parse ys "multiline implicit key"))
-             (setf pending nil)
-             (setf chars (s-flow-folded ys chars indent)))
+             (discard-pending)
+             (s-flow-folded ys indent))
             ((s-white-p c)
-             (push (ys-next ys) pending))
+             (unless pending-fp
+               (setf pending-fp (fill-pointer (ys-buf ys))))
+             (ys-buf-push ys (ys-next ys)))
             (t
              (flush-pending)
-             (push (ys-next ys) chars))))))))
+             (ys-buf-push ys (ys-next ys)))))))))
 
 (defun c-single-quoted (ys &key (indent -1) single-line)
   "[120] c-single-quoted(n,c) / [121] nb-single-text. [117] c-quoted-quote = ''."
   (unless (eql (ys-next ys) #\')
     (fail-parse ys "expected '"))
-  (let ((chars '()))
-    (loop
-      (let ((c (ys-peek ys)))
-        (cond
-          ((null c) (fail-parse ys "unterminated single-quoted string"))
-          ((char= c #\')
-           (ys-next ys)
-           (if (eql (ys-peek ys) #\')
-               (push (ys-next ys) chars)
-               (return (coerce (nreverse chars) 'string))))
-          ((c-forbidden-p ys)
-           (fail-parse ys "document marker inside single-quoted scalar"))
-          ((b-break-p c)
-           (when single-line
-             (fail-parse ys "multiline implicit key"))
-           (setf chars (s-flow-folded ys chars indent)))
-          (t
-           (push (ys-next ys) chars)))))))
+  (ys-buf-clear ys)
+  (loop
+    (let ((c (ys-peek ys)))
+      (cond
+        ((null c) (fail-parse ys "unterminated single-quoted string"))
+        ((char= c #\')
+         (ys-next ys)
+         (if (eql (ys-peek ys) #\')
+             (ys-buf-push ys (ys-next ys))
+             (return (ys-buf-take ys))))
+        ((c-forbidden-p ys)
+         (fail-parse ys "document marker inside single-quoted scalar"))
+        ((b-break-p c)
+         (when single-line
+           (fail-parse ys "multiline implicit key"))
+         (s-flow-folded ys indent))
+        (t
+         (ys-buf-push ys (ys-next ys)))))))
 
 (defun plain-stop-p (c flow)
   "[129]/[132] — flow indicators end ns-plain. Breaks are [133] vs [135]."
@@ -603,74 +710,99 @@
   "[133] ns-plain-one-line (block-key / flow-key) vs
    [135] ns-plain-multi-line (flow-in / flow-out / block-in).
    After a break, s-white (including tab) is s-line-prefix, not content (HS5T).
-   `-` starts a new block seq only at col <= n (AB8U)."
-  (let ((chars '()))
-    (loop
-      (let ((c (ys-peek ys)))
-        (cond
-          ((and (b-break-p c) single-line)
-           (return))
-          ((b-break-p c)
-           (when (c-forbidden-p ys)
+   `-` starts a new block seq only at col <= n (AB8U).
+   One-line (no fold) is a displaced slice of ys-text."
+  (let ((start (ys-pos ys))
+        (folded nil)
+        (chars '()))
+    (flet ((hash-comment-p ()
+             (if folded
+                 (and chars (s-white-p (car chars)))
+                 (and (> (ys-pos ys) start)
+                      (s-white-p (char (ys-text ys) (1- (ys-pos ys)))))))
+           (ensure-folded-chars ()
+             (unless folded
+               (loop for i from start below (ys-pos ys)
+                     do (push (char (ys-text ys) i) chars))
+               (setf folded t))))
+      (loop
+        (let ((c (ys-peek ys)))
+          (cond
+            ((and (b-break-p c) single-line)
              (return))
-           (let ((saved (ys-pos ys))
-                 (saved-col (ys-col ys))
-                 (saved-chars chars))
-             (loop while (and chars (s-white-p (car chars)))
-                   do (pop chars))
-             (b-as-line-feed ys)
-             (let ((empty 0)
-                   (ok t))
-               (loop
+            ((b-break-p c)
+             (when (c-forbidden-p ys)
+               (return))
+             (ensure-folded-chars)
+             (let ((saved (ys-pos ys))
+                   (saved-col (ys-col ys))
+                   (saved-chars chars))
+               (loop while (and chars (s-white-p (car chars)))
+                     do (pop chars))
+               (b-as-line-feed ys)
+               (let ((empty 0)
+                     (ok t))
+                 (loop
+                   (s-separate-in-line ys)
+                   (cond
+                     ((b-break-p (ys-peek ys))
+                      (b-as-line-feed ys)
+                      (incf empty))
+                     (t (return))))
                  (s-separate-in-line ys)
-                 (cond
-                   ((b-break-p (ys-peek ys))
-                    (b-as-line-feed ys)
-                    (incf empty))
-                   (t (return))))
-               (s-separate-in-line ys)
-               (let ((col (ys-column ys))
-                     (n (ys-peek ys)))
-                 (when (or (null n)
-                           (if flow (< col indent) (<= col indent))
-                           (c-forbidden-p ys)
-                           (c-nb-comment-text-p ys)
-                           (and flow (c-flow-indicator-p n))
-                           (and (eql n #\-)
-                                (<= col indent)
-                                (let ((x (ys-peek ys 1)))
-                                  (or (null x) (s-white-p x) (b-break-p x))))
-                           (and (eql n #\?)
-                                (<= col indent)
-                                (let ((x (ys-peek ys 1)))
-                                  (or (null x) (s-white-p x) (b-break-p x))))
-                           (and (eql n #\:)
-                                (<= col indent)
-                                (let ((x (ys-peek ys 1)))
-                                  (or (null x) (s-white-p x) (b-break-p x)))))
-                   (ys-goto ys saved saved-col)
-                   (setf chars saved-chars
-                         ok nil)))
-               (if ok
-                   (if (plusp empty)
-                       (dotimes (i empty) (push #\Newline chars))
-                       (push #\Space chars))
-                   (return)))))
-          ((plain-stop-p c flow)
-           (return))
-          ((and (eql c #\:) (colon-ends-plain-p ys flow))
-           (return))
-          ((and (s-white-p c) (eql (ys-peek ys 1) #\#))
-           (return))
-          ((eql c #\#)
-           (if (and chars (s-white-p (car chars)))
-               (return)
-               (push (ys-next ys) chars)))
-          (t
-           (push (ys-next ys) chars)))))
-    (loop while (and chars (s-white-p (car chars)))
-          do (pop chars))
-    (coerce (nreverse chars) 'string)))
+                 (let ((col (ys-column ys))
+                       (n (ys-peek ys)))
+                   (when (or (null n)
+                             (if flow (< col indent) (<= col indent))
+                             (c-forbidden-p ys)
+                             (c-nb-comment-text-p ys)
+                             (and flow (c-flow-indicator-p n))
+                             (and (eql n #\-)
+                                  (<= col indent)
+                                  (let ((x (ys-peek ys 1)))
+                                    (or (null x) (s-white-p x) (b-break-p x))))
+                             (and (eql n #\?)
+                                  (<= col indent)
+                                  (let ((x (ys-peek ys 1)))
+                                    (or (null x) (s-white-p x) (b-break-p x))))
+                             (and (eql n #\:)
+                                  (<= col indent)
+                                  (let ((x (ys-peek ys 1)))
+                                    (or (null x) (s-white-p x) (b-break-p x)))))
+                     (ys-goto ys saved saved-col)
+                     (setf chars saved-chars
+                           ok nil)))
+                 (if ok
+                     (if (plusp empty)
+                         (dotimes (i empty) (push #\Newline chars))
+                         (push #\Space chars))
+                     (return)))))
+            ((plain-stop-p c flow)
+             (return))
+            ((and (eql c #\:) (colon-ends-plain-p ys flow))
+             (return))
+            ((and (s-white-p c) (eql (ys-peek ys 1) #\#))
+             (return))
+            ((eql c #\#)
+             (if (hash-comment-p)
+                 (return)
+                 (if folded
+                     (push (ys-next ys) chars)
+                     (ys-next ys))))
+            (t
+             (if folded
+                 (push (ys-next ys) chars)
+                 (ys-next ys))))))
+      (if folded
+          (progn
+            (loop while (and chars (s-white-p (car chars)))
+                  do (pop chars))
+            (coerce (nreverse chars) 'string))
+          (let ((end (ys-pos ys))
+                (text (ys-text ys)))
+            (loop while (and (> end start) (s-white-p (char text (1- end))))
+                  do (decf end))
+            (%text-slice text start end))))))
 
 ;;;; ch. 8 Block Styles
 
@@ -1522,14 +1654,251 @@
           (return))
         (setf need-suffix (eq kind t))))))
 
+(defun %json-ws (text i)
+  (declare (type string text) (type fixnum i))
+  (let ((n (length text)))
+    (loop while (and (< i n)
+                     (let ((c (char text i)))
+                       (or (char= c #\Space) (char= c #\Tab)
+                           (char= c #\Newline) (char= c #\Return))))
+          do (incf i))
+    i))
+
+(defun %json-string (text i)
+  (declare (type string text) (type fixnum i))
+  (let ((n (length text)))
+    (unless (and (< i n) (char= (char text i) #\"))
+      (return-from %json-string (values nil nil)))
+    (incf i)
+    (let ((start i)
+          (need-copy nil)
+          (out nil))
+      (flet ((ensure-copy ()
+               (unless need-copy
+                 (setf need-copy t
+                       out (make-array (max 0 (- i start))
+                                       :element-type 'character
+                                       :adjustable t
+                                       :fill-pointer (max 0 (- i start))))
+                 (when (plusp (- i start))
+                   (replace out text :start2 start :end2 i)))))
+        (loop
+          (when (>= i n)
+            (return-from %json-string (values nil nil)))
+          (let ((c (char text i)))
+            (cond
+              ((char= c #\")
+               (return (values (if need-copy
+                                   (subseq out 0 (fill-pointer out))
+                                   (%text-slice text start i))
+                               (1+ i))))
+              ((char= c #\\)
+               (ensure-copy)
+               (incf i)
+               (when (>= i n)
+                 (return-from %json-string (values nil nil)))
+               (let ((e (char text i)))
+                 (case e
+                   (#\" (vector-push-extend #\" out))
+                   (#\\ (vector-push-extend #\\ out))
+                   (#\/ (vector-push-extend #\/ out))
+                   (#\b (vector-push-extend #\Backspace out))
+                   (#\f (vector-push-extend #\Page out))
+                   (#\n (vector-push-extend #\Newline out))
+                   (#\r (vector-push-extend #\Return out))
+                   (#\t (vector-push-extend #\Tab out))
+                   (#\u
+                    (when (> (+ i 5) n)
+                      (return-from %json-string (values nil nil)))
+                    (let ((code 0))
+                      (dotimes (k 4)
+                        (incf i)
+                        (let ((d (digit-char-p (char text i) 16)))
+                          (unless d
+                            (return-from %json-string (values nil nil)))
+                          (setf code (+ (* code 16) d))))
+                      (vector-push-extend (or (code-char code) #\?) out)))
+                   (t (return-from %json-string (values nil nil))))
+                 (incf i)))
+              ((char< c #\Space)
+               (return-from %json-string (values nil nil)))
+              (t
+               (when need-copy
+                 (vector-push-extend c out))
+               (incf i)))))))))
+
+(defun %json-number (text i)
+  (declare (type string text) (type fixnum i))
+  (let ((n (length text))
+        (start i))
+    (when (and (< i n) (char= (char text i) #\-))
+      (incf i))
+    (when (>= i n)
+      (return-from %json-number (values nil nil)))
+    (let ((c (char text i)))
+      (cond
+        ((char= c #\0) (incf i))
+        ((char<= #\1 c #\9)
+         (loop do (incf i)
+               while (and (< i n) (digit-char-p (char text i)))))
+        (t (return-from %json-number (values nil nil)))))
+    (let ((realp nil))
+      (when (and (< i n) (char= (char text i) #\.))
+        (incf i)
+        (unless (and (< i n) (digit-char-p (char text i)))
+          (return-from %json-number (values nil nil)))
+        (setf realp t)
+        (loop do (incf i)
+              while (and (< i n) (digit-char-p (char text i)))))
+      (when (and (< i n) (or (char= (char text i) #\e) (char= (char text i) #\E)))
+        (incf i)
+        (when (and (< i n) (or (char= (char text i) #\+) (char= (char text i) #\-)))
+          (incf i))
+        (unless (and (< i n) (digit-char-p (char text i)))
+          (return-from %json-number (values nil nil)))
+        (setf realp t)
+        (loop do (incf i)
+              while (and (< i n) (digit-char-p (char text i)))))
+      (values (if realp
+                  (let ((*read-default-float-format* 'double-float)
+                        (*read-eval* nil))
+                    (or (ignore-errors
+                          (let ((v (read-from-string text t nil :start start :end i)))
+                            (and (numberp v) (float v 1.0d0))))
+                        (return-from %json-number (values nil nil))))
+                  (parse-integer text :start start :end i))
+              i))))
+
+(defun %json-value (text i)
+  (declare (type string text) (type fixnum i))
+  (setf i (%json-ws text i))
+  (when (>= i (length text))
+    (return-from %json-value (values nil nil)))
+  (let ((c (char text i)))
+    (cond
+      ((char= c #\") (%json-string text i))
+      ((char= c #\{) (%json-object text i))
+      ((char= c #\[) (%json-array text i))
+      ((char= c #\t)
+       (if (and (<= (+ i 4) (length text))
+                (string= text "true" :start1 i :end1 (+ i 4)))
+           (values t (+ i 4))
+           (values nil nil)))
+      ((char= c #\f)
+       (if (and (<= (+ i 5) (length text))
+                (string= text "false" :start1 i :end1 (+ i 5)))
+           (values nil (+ i 5))
+           (values nil nil)))
+      ((char= c #\n)
+       (if (and (<= (+ i 4) (length text))
+                (string= text "null" :start1 i :end1 (+ i 4)))
+           (values :null (+ i 4))
+           (values nil nil)))
+      ((or (char= c #\-) (digit-char-p c))
+       (%json-number text i))
+      (t (values nil nil)))))
+
+(defun %json-object (text i)
+  (declare (type string text) (type fixnum i))
+  (incf i)
+  (setf i (%json-ws text i))
+  (let ((n (length text))
+        (ht (make-hash-table :test #'equal)))
+    (when (and (< i n) (char= (char text i) #\}))
+      (return-from %json-object (values ht (1+ i))))
+    (loop
+      (multiple-value-bind (k j) (%json-string text i)
+        (unless j (return-from %json-object (values nil nil)))
+        (setf i (%json-ws text j))
+        (unless (and (< i n) (char= (char text i) #\:))
+          (return-from %json-object (values nil nil)))
+        (incf i)
+        (setf i (%json-ws text i))
+        (multiple-value-bind (v j2) (%json-value text i)
+          (unless j2 (return-from %json-object (values nil nil)))
+          (setf (gethash k ht) v
+                i (%json-ws text j2))))
+      (cond
+        ((and (< i n) (char= (char text i) #\}))
+         (return (values ht (1+ i))))
+        ((and (< i n) (char= (char text i) #\,))
+         (incf i)
+         (setf i (%json-ws text i))
+         (when (and (< i n) (char= (char text i) #\}))
+           (return-from %json-object (values nil nil))))
+        (t (return-from %json-object (values nil nil)))))))
+
+(defun %json-array (text i)
+  (declare (type string text) (type fixnum i))
+  (incf i)
+  (setf i (%json-ws text i))
+  (let ((n (length text))
+        (items (make-array 4 :adjustable t :fill-pointer 0)))
+    (when (and (< i n) (char= (char text i) #\]))
+      (return-from %json-array (values items (1+ i))))
+    (loop
+      (multiple-value-bind (v j) (%json-value text i)
+        (unless j (return-from %json-array (values nil nil)))
+        (vector-push-extend v items)
+        (setf i (%json-ws text j)))
+      (cond
+        ((and (< i n) (char= (char text i) #\]))
+         (return (values items (1+ i))))
+        ((and (< i n) (char= (char text i) #\,))
+         (incf i)
+         (setf i (%json-ws text i))
+         (when (and (< i n) (char= (char text i) #\]))
+           (return-from %json-array (values nil nil))))
+        (t (return-from %json-array (values nil nil)))))))
+
+(defun try-json-fast-path (text)
+  "Strict JSON → Lisp mapping. Leftover (including `# comment`) → fail.
+   Returns (values value t) or (values nil nil). Decode only — no events."
+  (let ((i 0)
+        (n (length text)))
+    (when (and (plusp n) (char= (char text 0) #\ufeff))
+      (setf i 1))
+    (setf i (%json-ws text i))
+    (when (>= i n)
+      (return-from try-json-fast-path (values nil nil)))
+    (multiple-value-bind (val j) (%json-value text i)
+      (unless j
+        (return-from try-json-fast-path (values nil nil)))
+      (setf j (%json-ws text j))
+      (if (>= j n)
+          (values val t)
+          (values nil nil)))))
+
 (defun parse-events-from-string (text)
-  (let ((ys (make-ys (or text ""))))
-    (c-byte-order-mark ys)
-    (reset-tag-handles ys)
-    (emit ys :stream-start)
-    (l-yaml-stream ys)
-    (emit ys :stream-end)
-    (coerce (ys-events ys) 'list)))
+  (let ((ys (acquire-ys (or text ""))))
+    (unwind-protect
+         (progn
+           (c-byte-order-mark ys)
+           (reset-tag-handles ys)
+           (emit ys :stream-start)
+           (l-yaml-stream ys)
+           (emit ys :stream-end)
+           (take-events ys))
+      (release-ys ys))))
+
+(defun parse-yaml-live (text &key all)
+  (let ((ys (acquire-ys (or text "")))
+        (live (make-live-composer)))
+    (unwind-protect
+         (progn
+           (setf (ys-sink ys) (lambda (kind &rest keys)
+                                (apply #'live-on-event live kind keys)))
+           (c-byte-order-mark ys)
+           (reset-tag-handles ys)
+           (emit ys :stream-start)
+           (l-yaml-stream ys)
+           (emit ys :stream-end)
+           (live-result live :all all))
+      (release-ys ys))))
 
 (defun parse-yaml (text &key all)
-  (compose-events (parse-events-from-string text) :all all))
+  (let ((text (or text "")))
+    (multiple-value-bind (json ok) (try-json-fast-path text)
+      (if ok
+          (if all (vector json) json)
+          (parse-yaml-live text :all all)))))

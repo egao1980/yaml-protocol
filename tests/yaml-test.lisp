@@ -181,13 +181,26 @@
 
 (deftest yaml-events-smoke
   (let ((ev (parse-events (format nil "a: &x 1~%b: *x~%"))))
+    (ok (vectorp ev))
     (ok (equal '(:stream-start :document-start :mapping-start
                  :scalar :scalar :scalar :alias
                  :mapping-end :document-end :stream-end)
-               (mapcar #'yaml-event-kind ev)))
-    (ok (string= "x" (yaml-event-anchor (nth 4 ev))))
-    (ok (string= "x" (yaml-event-value (nth 6 ev))))
+               (map 'list #'yaml-event-kind ev)))
+    (ok (string= "x" (yaml-event-anchor (elt ev 4))))
+    (ok (string= "x" (yaml-event-value (elt ev 6))))
     (ok (search "=ALI *x" (format-events ev)))))
+
+(deftest yaml-json-fast-path-and-fallback
+  "Strict JSON hits the fast path. YAML-only / leftover → full parser."
+  (ok (= 1 (gethash "a" (decode "{\"a\":1}"))))
+  (ok (= 1 (gethash "a" (decode "{a:1}"))))
+  (ok (= 1 (gethash "a" (decode (format nil "{\"a\":1} # c")))))
+  (ok (eq nil (decode "false")))
+  (ok (eq :null (decode "null")))
+  (ok (eq :null (decode "")))
+  (ok (equalp #() (decode-all "")))
+  (ok (equalp #(1) (decode-all "1")))
+  (ok (equalp #(1 2) (decode-all (format nil "1~%---~%2~%")))))
 
 (deftest yaml-extends-json
   "YAML is a CLOS extension of JSON, not a sibling and not the parent."

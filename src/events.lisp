@@ -173,9 +173,10 @@
 (defun format-events (events)
   "Render EVENTS as yaml-test-suite test.event text (trailing newline)."
   (with-output-to-string (o)
-    (dolist (ev (coerce events 'list))
-      (format-event ev o)
-      (write-char #\Newline o))))
+    (map nil (lambda (ev)
+               (format-event ev o)
+               (write-char #\Newline o))
+         events)))
 
 (defun stringify-key (key)
   (cond
@@ -205,10 +206,8 @@
         (merge-mapping ht val)
         (setf (gethash k ht) val))))
 
-(defun %resolve-scalar (event)
-  (let* ((raw (or (yaml-event-value event) ""))
-         (tag (yaml-event-tag event))
-         (style (yaml-event-style event)))
+(defun %resolve-scalar-raw (raw tag style)
+  (let ((raw (or raw "")))
     (cond
       ((null tag)
        (if (eq style :plain)
@@ -233,6 +232,11 @@
        (if (eq style :plain)
            (resolve-plain raw)
            raw)))))
+
+(defun %resolve-scalar (event)
+  (%resolve-scalar-raw (yaml-event-value event)
+                       (yaml-event-tag event)
+                       (yaml-event-style event)))
 
 (defstruct composer
   (events #() :type vector)
@@ -291,7 +295,9 @@
   "Build Lisp values from an event stream.
    Aliases are EQ to the anchored object. Collections are registered
    before they are filled so cycles work. ALL true → vector of documents."
-  (let ((c (make-composer :events (coerce events 'vector)
+  (let ((c (make-composer :events (if (and (vectorp events) (not (stringp events)))
+                                      events
+                                      (coerce events 'vector))
                           :anchors (make-hash-table :test #'equal)))
         (docs '()))
     (%c-expect c :stream-start)
@@ -313,6 +319,102 @@
     (when (eq (%c-peek c) :stream-end)
       (%c-next c))
     (setf docs (nreverse docs))
+    (if all
+        (coerce docs 'vector)
+        (if docs
+            (first docs)
+            :null))))
+
+;;; Live compose (decode only). Events never materialize. Lookaheads must
+;;; nil ys-sink and scratch on the event vector (with-ys-checkpoint).
+
+(defstruct (lframe (:constructor %lframe (kind container)))
+  (kind :seq :type keyword)
+  container
+  (want-key t)
+  pending-key)
+
+(defstruct (live-composer (:constructor %make-live-composer))
+  (stack nil)
+  (anchors nil)
+  (docs nil)
+  (root :empty))
+
+(defun make-live-composer ()
+  (%make-live-composer :anchors (make-hash-table :test #'equal)))
+
+(defun live-bind (live object anchor)
+  (when anchor
+    (setf (gethash anchor (live-composer-anchors live)) object))
+  object)
+
+(defun live-place (live object)
+  (let ((frame (car (live-composer-stack live))))
+    (cond
+      ((null frame)
+       (setf (live-composer-root live) object))
+      ((eq (lframe-kind frame) :seq)
+       (vector-push-extend object (lframe-container frame)))
+      (t
+       (if (lframe-want-key frame)
+           (setf (lframe-pending-key frame) object
+                 (lframe-want-key frame) nil)
+           (progn
+             (assign-map-entry (lframe-container frame)
+                               (lframe-pending-key frame)
+                               object)
+             (setf (lframe-want-key frame) t
+                   (lframe-pending-key frame) nil))))))
+  object)
+
+(defun live-on-event (live kind &key implicit flow-p anchor tag style value)
+  (declare (ignore implicit flow-p))
+  (ecase kind
+    (:stream-start)
+    (:stream-end)
+    (:document-start
+     (setf (live-composer-anchors live) (make-hash-table :test #'equal)
+           (live-composer-root live) :empty
+           (live-composer-stack live) nil))
+    (:document-end
+     (when (live-composer-stack live)
+       (error 'yaml-parse-error :message "unclosed collection at document end"))
+     (push (if (eq (live-composer-root live) :empty)
+               :null
+               (live-composer-root live))
+           (live-composer-docs live))
+     (setf (live-composer-root live) :empty))
+    (:scalar
+     (live-place live (live-bind live (%resolve-scalar-raw value tag style) anchor)))
+    (:alias
+     (let ((val (gethash value (live-composer-anchors live) :missing)))
+       (when (eq val :missing)
+         (error 'yaml-parse-error
+                :message (format nil "unknown alias *~A" value)))
+       (live-place live val)))
+    (:sequence-start
+     (let ((items (make-array 8 :adjustable t :fill-pointer 0)))
+       (live-bind live items anchor)
+       (live-place live items)
+       (push (%lframe :seq items) (live-composer-stack live))))
+    (:sequence-end
+     (let ((frame (car (live-composer-stack live))))
+       (unless (and frame (eq (lframe-kind frame) :seq))
+         (error 'yaml-parse-error :message "unexpected -SEQ"))
+       (pop (live-composer-stack live))))
+    (:mapping-start
+     (let ((ht (make-hash-table :test #'equal)))
+       (live-bind live ht anchor)
+       (live-place live ht)
+       (push (%lframe :map ht) (live-composer-stack live))))
+    (:mapping-end
+     (let ((frame (car (live-composer-stack live))))
+       (unless (and frame (eq (lframe-kind frame) :map))
+         (error 'yaml-parse-error :message "unexpected -MAP"))
+       (pop (live-composer-stack live))))))
+
+(defun live-result (live &key all)
+  (let ((docs (nreverse (live-composer-docs live))))
     (if all
         (coerce docs 'vector)
         (if docs
