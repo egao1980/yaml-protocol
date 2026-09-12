@@ -393,8 +393,9 @@
    Same-line properties belong to the next node (often a mapping key);
    properties + break belong to the following collection (2SXE vs 26DV)."
   (declare (ignore indent))
-  (skip-blanks ys)
-  (skip-comment ys)
+  (s-separate-in-line ys)
+  (when (c-nb-comment-text-p ys)
+    (skip-comment ys))
   (cond
     ((or (break-p (ys-peek ys)) (ys-eof-p ys))
      (skip-break ys)
@@ -483,9 +484,8 @@
   (let ((chars '())
         (pending '()))
     (flet ((flush-pending ()
-             (dolist (w pending)
-               (push w chars))
-             (setf pending nil)))
+             (setf chars (append pending chars)
+                   pending nil)))
       (loop
         (let ((c (ys-peek ys)))
           (cond
@@ -501,7 +501,7 @@
              (ys-next ys)
              (let ((x (dq-unescape ys)))
                (if (eq x :escaped-break)
-                   (s-separate-in-line ys)
+                   nil
                    (push x chars))))
             ((b-break-p c)
              (when single-line
@@ -801,15 +801,17 @@
            (ignore-errors (parse-anchor-name ys)))
           ((eql (ys-peek ys) #\[)
            (let ((start (ys-pos ys)))
-             (unless (ignore-errors (parse-flow-seq ys))
-               (return-from looks-like-block-map-p nil))
+             (handler-case (parse-flow-seq ys)
+               (yaml-parse-error ()
+                 (return-from looks-like-block-map-p nil)))
              (when (loop for i from start below (ys-pos ys)
                          thereis (b-break-p (char (ys-text ys) i)))
                (return-from looks-like-block-map-p nil))))
           ((eql (ys-peek ys) #\{)
            (let ((start (ys-pos ys)))
-             (unless (ignore-errors (parse-flow-map ys))
-               (return-from looks-like-block-map-p nil))
+             (handler-case (parse-flow-map ys)
+               (yaml-parse-error ()
+                 (return-from looks-like-block-map-p nil)))
              (when (loop for i from start below (ys-pos ys)
                          thereis (b-break-p (char (ys-text ys) i)))
                (return-from looks-like-block-map-p nil))))
@@ -903,8 +905,6 @@
   (s-l-comments ys)
   (unless (eql (ys-peek ys) #\:)
     (fail-parse ys "expected : in flow pair"))
-  (when (colon-after-break-p ys)
-    (fail-parse ys "implicit key must be on one line"))
   (ys-next ys)
   (s-l-comments ys)
   (if (member (ys-peek ys) '(#\, #\] #\}))
@@ -1002,8 +1002,6 @@
           (s-l-comments ys)
           (cond
             ((eql (ys-peek ys) #\:)
-             (when (colon-after-break-p ys)
-               (fail-parse ys "implicit key must be on one line"))
              (ys-next ys)
              (s-l-comments ys)
              (if (member (ys-peek ys) '(#\, #\}))
@@ -1245,7 +1243,8 @@
             ((or (null c)
                  (and flow (c-flow-indicator-p c))
                  (and (eql c #\:) (colon-ends-plain-p ys flow)
-                      (or flow (eq key :implicit) (eq key :explicit)
+                      (or flow
+                          (eq key :implicit)
                           (not (looks-like-block-map-p ys))))
                  (and (not flow)
                       (or (c-forbidden-p ys)
