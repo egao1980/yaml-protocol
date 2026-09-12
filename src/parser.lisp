@@ -516,8 +516,13 @@
                                                (< col content-indent)))
              (fail-parse ys "tab used as indentation"))
             ((or (ys-eof-p ys) (break-p (ys-peek ys)))
-             (setf max-empty (max max-empty col))
-             (push "" lines)
+             (cond
+               ((and content-indent (> col content-indent))
+                (push (make-string (- col content-indent) :initial-element #\Space)
+                      lines))
+               (t
+                (setf max-empty (max max-empty col))
+                (push "" lines)))
              (skip-break ys))
             ((and content-indent (< col content-indent)
                   (eql (ys-peek ys) #\#))
@@ -558,6 +563,7 @@
 (defun %join-folded (lines)
   (with-output-to-string (out)
     (let ((prev-empty t)
+          (prev-more nil)
           (first t))
       (dolist (line lines)
         (let ((empty (zerop (length line)))
@@ -566,17 +572,22 @@
           (cond
             (empty
              (write-char #\Newline out)
-             (setf prev-empty t))
+             (when prev-more
+               (write-char #\Newline out))
+             (setf prev-empty t prev-more nil))
             (more
              (unless first
                (write-char #\Newline out))
              (write-string line out)
-             (setf prev-empty nil first nil))
+             (setf prev-empty nil first nil prev-more t))
             (t
-             (unless (or first prev-empty)
-               (write-char #\Space out))
+             (unless first
+               (cond
+                 (prev-empty)
+                 (prev-more (write-char #\Newline out))
+                 (t (write-char #\Space out))))
              (write-string line out)
-             (setf prev-empty nil first nil))))))))
+             (setf prev-empty nil first nil prev-more nil))))))))
 
 (defun %apply-chomp (text chomp)
   (ecase chomp
