@@ -188,7 +188,7 @@
   (decf (ys-col ys) n))
 
 (defun emit-packed (ys kind implicit flow-p anchor tag style value)
-  "SoA-style: 7 slots per event in ys-events. take-events copies the used slots.")
+  "SoA-style: 7 slots per event in ys-events. take-events copies the used slots."
   (declare (type ys ys) (optimize (speed 3) (safety 1)))
   (let* ((evs (ys-events ys))
          (fp (fill-pointer evs))
@@ -208,7 +208,7 @@
 
 (defun emit-event (ys kind implicit flow-p anchor tag style value)
   "Positional emit. Live compose never builds events. parse-events returns
-   packed YAML-EVENTS (box-events is opt-in).")
+   packed YAML-EVENTS (box-events is opt-in)."
   (declare (type ys ys) (optimize (speed 3) (safety 1)))
   (let ((anchor (and (stringp anchor) (plusp (length anchor)) anchor))
         (style (or style :plain))
