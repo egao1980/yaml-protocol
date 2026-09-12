@@ -193,7 +193,8 @@
 (deftest yaml-json-fast-path-and-fallback
   "Strict JSON hits the fast path. YAML-only / leftover → full parser."
   (ok (= 1 (gethash "a" (decode "{\"a\":1}"))))
-  (ok (= 1 (gethash "a" (decode "{a:1}"))))
+  (ok (= 1 (gethash "a" (decode "{a: 1}"))))
+  (ok (eq :null (gethash "a:1" (decode "{a:1}"))))
   (ok (= 1 (gethash "a" (decode (format nil "{\"a\":1} # c")))))
   (ok (eq nil (decode "false")))
   (ok (eq :null (decode "null")))
