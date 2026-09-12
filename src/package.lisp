@@ -34,6 +34,17 @@
            #:yaml-event-tag
            #:yaml-event-style
            #:yaml-event-value
+           #:yaml-events
+           #:yaml-events-p
+           #:yaml-events-count
+           #:event-kind
+           #:event-implicit
+           #:event-flow-p
+           #:event-anchor
+           #:event-tag
+           #:event-style
+           #:event-value
+           #:box-events
            #:parse-events
            #:format-events
            #:compose-events

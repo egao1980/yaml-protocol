@@ -23,9 +23,9 @@ YAML 1.2 Core scalars (`NO` is a string, not boolean).
 
 ## Events
 
-`parse-events` is the parser. It emits a **vector** of [yaml-test-suite](https://github.com/yaml/yaml-test-suite) events (`+STR` / `+DOC` / `+MAP` / `+SEQ` / `=VAL` / `=ALI` / …). Anchors, tags, and scalar style live on the event; aliases are **not** resolved in the stream.
+`parse-events` is the parser. It returns packed `yaml-events` (stride-7 slots, not a vector of structs). Suite DSL kinds are `+STR` / `+DOC` / `+MAP` / `+SEQ` / `=VAL` / `=ALI` / …. Read with `(event-kind events i)` … `(event-value events i)`; `yaml-events-count` is the length. `box-events` allocates a vector of `yaml-event` if you need structs. Aliases are **not** resolved in the stream.
 
-`compose-events` builds the Lisp graph from that vector: Core schema on plain scalars, alias identity, `<<` merge (existing keys win).
+`compose-events` builds the Lisp graph from packed or boxed events: Core schema on plain scalars, alias identity, `<<` merge (existing keys win).
 
 `decode` / `decode-all` do **not** allocate the event vector: they compose while parsing (same graph rules). Strict JSON (`{"a":1}`, quoted keys, no comments) takes a fast path with the same Lisp mapping; leftover after a JSON value (including `# comment`) falls back to YAML. `{a:1}` is YAML, not JSON.
 

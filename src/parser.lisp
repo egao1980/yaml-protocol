@@ -74,27 +74,16 @@
   (setf *ys-cache* ys)
   nil)
 
-(defconstant +ev-stride+ 7)
-
 (defun take-events (ys)
-  "Materialize packed slots into YAML-EVENT objects. Buffer stays on YS."
+  "Return packed YAML-EVENTS. Copy used slots so YS can reuse the buffer."
   (let* ((evs (ys-events ys))
          (n (fill-pointer evs))
          (count (truncate n +ev-stride+))
-         (out (make-array count)))
+         (data (make-array n)))
     (declare (type fixnum n count))
-    (loop for i from 0 below count
-          for b of-type fixnum = (* i +ev-stride+)
-          do (setf (aref out i)
-                   (%yaml-event (aref evs b)
-                                (aref evs (the fixnum (+ b 1)))
-                                (aref evs (the fixnum (+ b 2)))
-                                (aref evs (the fixnum (+ b 3)))
-                                (aref evs (the fixnum (+ b 4)))
-                                (aref evs (the fixnum (+ b 5)))
-                                (aref evs (the fixnum (+ b 6))))))
+    (replace data evs :end1 n :end2 n)
     (setf (fill-pointer evs) 0)
-    out))
+    (%yaml-events data count)))
 
 (declaim (inline ys-buf-clear ys-buf-push ys-buf-take ys-buf-nspaces ys-buf-append))
 
@@ -199,7 +188,7 @@
   (decf (ys-col ys) n))
 
 (defun emit-packed (ys kind implicit flow-p anchor tag style value)
-  "SoA-style: 7 slots per event in ys-events. No yaml-event until take-events."
+  "SoA-style: 7 slots per event in ys-events. take-events copies the used slots.")
   (declare (type ys ys) (optimize (speed 3) (safety 1)))
   (let* ((evs (ys-events ys))
          (fp (fill-pointer evs))
@@ -218,8 +207,8 @@
           (fill-pointer evs) need)))
 
 (defun emit-event (ys kind implicit flow-p anchor tag style value)
-  "Positional emit. Live compose never builds events. parse-events packs
-   slots and materializes yaml-event only in take-events."
+  "Positional emit. Live compose never builds events. parse-events returns
+   packed YAML-EVENTS (box-events is opt-in).")
   (declare (type ys ys) (optimize (speed 3) (safety 1)))
   (let ((anchor (and (stringp anchor) (plusp (length anchor)) anchor))
         (style (or style :plain))

@@ -4,6 +4,8 @@
 ;;; Parser emits events; compose builds the Lisp graph. Aliases / << / Core
 ;;; schema are compose-time. :object-class is post-compose (see protocol.lisp).
 
+(defconstant +ev-stride+ 7)
+
 (defstruct (yaml-event
             (:constructor make-yaml-event)
             (:constructor %yaml-event (kind implicit flow-p anchor tag style value)))
@@ -14,6 +16,65 @@
   (tag nil)
   (style :plain)
   (value nil))
+
+(defstruct (yaml-events (:constructor %yaml-events (data count)))
+  "Packed event stream. DATA is stride-7 slots; COUNT is the event count."
+  (data #() :type simple-vector)
+  (count 0 :type fixnum))
+
+(declaim (inline event-kind event-implicit event-flow-p
+                 event-anchor event-tag event-style event-value))
+
+(defun event-kind (events i)
+  (declare (type yaml-events events) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (aref (yaml-events-data events) (the fixnum (* i +ev-stride+))))
+
+(defun event-implicit (events i)
+  (declare (type yaml-events events) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (aref (yaml-events-data events) (the fixnum (+ (the fixnum (* i +ev-stride+)) 1))))
+
+(defun event-flow-p (events i)
+  (declare (type yaml-events events) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (aref (yaml-events-data events) (the fixnum (+ (the fixnum (* i +ev-stride+)) 2))))
+
+(defun event-anchor (events i)
+  (declare (type yaml-events events) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (aref (yaml-events-data events) (the fixnum (+ (the fixnum (* i +ev-stride+)) 3))))
+
+(defun event-tag (events i)
+  (declare (type yaml-events events) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (aref (yaml-events-data events) (the fixnum (+ (the fixnum (* i +ev-stride+)) 4))))
+
+(defun event-style (events i)
+  (declare (type yaml-events events) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (aref (yaml-events-data events) (the fixnum (+ (the fixnum (* i +ev-stride+)) 5))))
+
+(defun event-value (events i)
+  (declare (type yaml-events events) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (aref (yaml-events-data events) (the fixnum (+ (the fixnum (* i +ev-stride+)) 6))))
+
+(defun box-events (events)
+  "Allocate a vector of YAML-EVENT from packed EVENTS. Opt-in; parse does not."
+  (let* ((n (yaml-events-count events))
+         (out (make-array n)))
+    (declare (type fixnum n))
+    (loop for i from 0 below n
+          do (setf (aref out i)
+                   (%yaml-event (event-kind events i)
+                                (event-implicit events i)
+                                (event-flow-p events i)
+                                (event-anchor events i)
+                                (event-tag events i)
+                                (event-style events i)
+                                (event-value events i))))
+    out))
 
 (declaim (inline hex-digit-p))
 
@@ -168,57 +229,82 @@
     (:literal #\|)
     (:folded #\>)))
 
-(defun format-event (event &optional (stream *standard-output*))
-  (let ((kind (yaml-event-kind event)))
-    (ecase kind
-      (:stream-start (write-string "+STR" stream))
-      (:stream-end (write-string "-STR" stream))
-      (:document-start
-       (write-string "+DOC" stream)
-       (unless (yaml-event-implicit event)
-         (write-string " ---" stream)))
-      (:document-end
-       (write-string "-DOC" stream)
-       (unless (yaml-event-implicit event)
-         (write-string " ..." stream)))
-      (:mapping-start
-       (write-string "+MAP" stream)
-       (when (yaml-event-flow-p event)
-         (write-string " {}" stream))
-       (when (yaml-event-anchor event)
-         (format stream " &~A" (yaml-event-anchor event)))
-       (when (yaml-event-tag event)
-         (format stream " <~A>" (yaml-event-tag event))))
-      (:sequence-start
-       (write-string "+SEQ" stream)
-       (when (yaml-event-flow-p event)
-         (write-string " []" stream))
-       (when (yaml-event-anchor event)
-         (format stream " &~A" (yaml-event-anchor event)))
-       (when (yaml-event-tag event)
-         (format stream " <~A>" (yaml-event-tag event))))
-      (:mapping-end (write-string "-MAP" stream))
-      (:sequence-end (write-string "-SEQ" stream))
-      (:scalar
-       (write-string "=VAL" stream)
-       (when (yaml-event-anchor event)
-         (format stream " &~A" (yaml-event-anchor event)))
-       (when (yaml-event-tag event)
-         (format stream " <~A>" (yaml-event-tag event)))
-       (write-char #\Space stream)
-       (write-char (%style-char (yaml-event-style event)) stream)
-       (write-string (%event-escape (or (yaml-event-value event) "")) stream))
-      (:alias
-       (format stream "=ALI *~A" (yaml-event-value event)))))
+(defun format-event-slots (kind implicit flow-p anchor tag style value
+                           &optional (stream *standard-output*))
+  (ecase kind
+    (:stream-start (write-string "+STR" stream))
+    (:stream-end (write-string "-STR" stream))
+    (:document-start
+     (write-string "+DOC" stream)
+     (unless implicit
+       (write-string " ---" stream)))
+    (:document-end
+     (write-string "-DOC" stream)
+     (unless implicit
+       (write-string " ..." stream)))
+    (:mapping-start
+     (write-string "+MAP" stream)
+     (when flow-p
+       (write-string " {}" stream))
+     (when anchor
+       (format stream " &~A" anchor))
+     (when tag
+       (format stream " <~A>" tag)))
+    (:sequence-start
+     (write-string "+SEQ" stream)
+     (when flow-p
+       (write-string " []" stream))
+     (when anchor
+       (format stream " &~A" anchor))
+     (when tag
+       (format stream " <~A>" tag)))
+    (:mapping-end (write-string "-MAP" stream))
+    (:sequence-end (write-string "-SEQ" stream))
+    (:scalar
+     (write-string "=VAL" stream)
+     (when anchor
+       (format stream " &~A" anchor))
+     (when tag
+       (format stream " <~A>" tag))
+     (write-char #\Space stream)
+     (write-char (%style-char style) stream)
+     (write-string (%event-escape (or value "")) stream))
+    (:alias
+     (format stream "=ALI *~A" value)))
   (values))
 
+(defun format-event (event &optional (stream *standard-output*))
+  (format-event-slots (yaml-event-kind event)
+                      (yaml-event-implicit event)
+                      (yaml-event-flow-p event)
+                      (yaml-event-anchor event)
+                      (yaml-event-tag event)
+                      (yaml-event-style event)
+                      (yaml-event-value event)
+                      stream))
+
+(defun format-event-at (events i &optional (stream *standard-output*))
+  (format-event-slots (event-kind events i)
+                      (event-implicit events i)
+                      (event-flow-p events i)
+                      (event-anchor events i)
+                      (event-tag events i)
+                      (event-style events i)
+                      (event-value events i)
+                      stream))
+
 (defun format-events (events)
-  "Render EVENTS as yaml-test-suite test.event text (trailing newline)."
+  "Render EVENTS as yaml-test-suite test.event text (trailing newline).
+   EVENTS is YAML-EVENTS or a sequence of YAML-EVENT."
   (with-output-to-string (o)
-    (map nil (lambda (ev)
-               (format-event ev o)
-               (write-char #\Newline o))
-         events)))
+    (if (yaml-events-p events)
+        (loop for i from 0 below (yaml-events-count events)
+              do (format-event-at events i o)
+                 (write-char #\Newline o))
+        (map nil (lambda (ev)
+                   (format-event ev o)
+                   (write-char #\Newline o))
+             events))))
 
 (defun stringify-key (key)
   (cond
@@ -275,97 +361,144 @@
            (resolve-plain raw)
            raw)))))
 
-(defun %resolve-scalar (event)
-  (%resolve-scalar-raw (yaml-event-value event)
-                       (yaml-event-tag event)
-                       (yaml-event-style event)))
-
 (defstruct composer
-  (events #() :type vector)
+  events
   (index 0 :type fixnum)
+  (n 0 :type fixnum)
+  (packed-p nil)
   (anchors nil))
 
+(declaim (inline %c-kind %c-anchor %c-tag %c-style %c-value))
+
+(defun %c-kind (c i)
+  (declare (type composer c) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (if (composer-packed-p c)
+      (event-kind (composer-events c) i)
+      (yaml-event-kind (aref (composer-events c) i))))
+
+(defun %c-anchor (c i)
+  (declare (type composer c) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (if (composer-packed-p c)
+      (event-anchor (composer-events c) i)
+      (yaml-event-anchor (aref (composer-events c) i))))
+
+(defun %c-tag (c i)
+  (declare (type composer c) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (if (composer-packed-p c)
+      (event-tag (composer-events c) i)
+      (yaml-event-tag (aref (composer-events c) i))))
+
+(defun %c-style (c i)
+  (declare (type composer c) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (if (composer-packed-p c)
+      (event-style (composer-events c) i)
+      (yaml-event-style (aref (composer-events c) i))))
+
+(defun %c-value (c i)
+  (declare (type composer c) (type fixnum i)
+           (optimize (speed 3) (safety 1)))
+  (if (composer-packed-p c)
+      (event-value (composer-events c) i)
+      (yaml-event-value (aref (composer-events c) i))))
+
 (defun %c-peek (c)
-  (when (< (composer-index c) (length (composer-events c)))
-    (yaml-event-kind (aref (composer-events c) (composer-index c)))))
+  (let ((i (composer-index c)))
+    (when (< i (composer-n c))
+      (%c-kind c i))))
 
 (defun %c-next (c)
-  (when (>= (composer-index c) (length (composer-events c)))
+  "Advance. Returns the event index (not a boxed YAML-EVENT)."
+  (when (>= (composer-index c) (composer-n c))
     (error 'yaml-parse-error :message "unexpected end of event stream"))
-  (prog1 (aref (composer-events c) (composer-index c))
+  (prog1 (composer-index c)
     (incf (composer-index c))))
 
 (defun %c-expect (c kind)
-  (let ((ev (%c-next c)))
-    (unless (eq (yaml-event-kind ev) kind)
+  (let ((i (%c-next c)))
+    (unless (eq (%c-kind c i) kind)
       (error 'yaml-parse-error
-             :message (format nil "expected ~A got ~A" kind (yaml-event-kind ev))))
-    ev))
+             :message (format nil "expected ~A got ~A" kind (%c-kind c i))))
+    i))
 
-(defun %c-bind (c ev object)
-  (when (yaml-event-anchor ev)
-    (setf (gethash (yaml-event-anchor ev) (composer-anchors c)) object))
+(defun %c-bind (c i object)
+  (let ((anchor (%c-anchor c i)))
+    (when anchor
+      (setf (gethash anchor (composer-anchors c)) object)))
   object)
 
 (defun %compose-node (c)
-  (let ((ev (%c-next c)))
-    (ecase (yaml-event-kind ev)
+  (let ((i (%c-next c)))
+    (ecase (%c-kind c i)
       (:alias
-       (let ((val (gethash (yaml-event-value ev) (composer-anchors c) :missing)))
+       (let* ((name (%c-value c i))
+              (val (gethash name (composer-anchors c) :missing)))
          (when (eq val :missing)
            (error 'yaml-parse-error
-                  :message (format nil "unknown alias *~A" (yaml-event-value ev))))
+                  :message (format nil "unknown alias *~A" name)))
          val))
       (:scalar
-       (%c-bind c ev (%resolve-scalar ev)))
+       (%c-bind c i (%resolve-scalar-raw (%c-value c i)
+                                        (%c-tag c i)
+                                        (%c-style c i))))
       (:sequence-start
        (let ((items (make-array 0 :adjustable t :fill-pointer 0)))
-         (%c-bind c ev items)
+         (%c-bind c i items)
          (loop until (eq (%c-peek c) :sequence-end)
                do (vector-push-extend (%compose-node c) items))
          (%c-expect c :sequence-end)
          items))
       (:mapping-start
        (let ((ht (make-hash-table :test #'equal)))
-         (%c-bind c ev ht)
+         (%c-bind c i ht)
          (loop until (eq (%c-peek c) :mapping-end)
                do (assign-map-entry ht (%compose-node c) (%compose-node c)))
          (%c-expect c :mapping-end)
          ht)))))
 
 (defun compose-events (events &key all)
-  "Build Lisp values from an event stream.
+  "Build Lisp values from an event stream (YAML-EVENTS or boxed YAML-EVENT).
    Aliases are EQ to the anchored object. Collections are registered
    before they are filled so cycles work. ALL true → vector of documents."
-  (let ((c (make-composer :events (if (and (vectorp events) (not (stringp events)))
-                                      events
-                                      (coerce events 'vector))
-                          :anchors (make-hash-table :test #'equal)))
-        (docs '()))
-    (%c-expect c :stream-start)
-    (loop
-      (let ((k (%c-peek c)))
-        (cond
-          ((or (null k) (eq k :stream-end))
-           (return))
-          ((eq k :document-start)
-           (%c-next c)
-           (setf (composer-anchors c) (make-hash-table :test #'equal))
-           (if (eq (%c-peek c) :document-end)
-               (push :null docs)
-               (push (%compose-node c) docs))
-           (%c-expect c :document-end))
-          (t
-           (error 'yaml-parse-error
-                  :message (format nil "unexpected event ~A" k))))))
-    (when (eq (%c-peek c) :stream-end)
-      (%c-next c))
-    (setf docs (nreverse docs))
-    (if all
-        (coerce docs 'vector)
-        (if docs
-            (first docs)
-            :null))))
+  (multiple-value-bind (stream n packed-p)
+      (cond
+        ((yaml-events-p events)
+         (values events (yaml-events-count events) t))
+        ((and (vectorp events) (not (stringp events)))
+         (values events (length events) nil))
+        (t
+         (let ((v (coerce events 'vector)))
+           (values v (length v) nil))))
+    (let ((c (make-composer :events stream :n n :packed-p packed-p
+                            :anchors (make-hash-table :test #'equal)))
+          (docs '()))
+      (%c-expect c :stream-start)
+      (loop
+        (let ((k (%c-peek c)))
+          (cond
+            ((or (null k) (eq k :stream-end))
+             (return))
+            ((eq k :document-start)
+             (%c-next c)
+             (setf (composer-anchors c) (make-hash-table :test #'equal))
+             (if (eq (%c-peek c) :document-end)
+                 (push :null docs)
+                 (push (%compose-node c) docs))
+             (%c-expect c :document-end))
+            (t
+             (error 'yaml-parse-error
+                    :message (format nil "unexpected event ~A" k))))))
+      (when (eq (%c-peek c) :stream-end)
+        (%c-next c))
+      (setf docs (nreverse docs))
+      (if all
+          (coerce docs 'vector)
+          (if docs
+              (first docs)
+              :null)))))
 
 ;;; Live compose (decode only). Events never materialize. Lookaheads must
 ;;; nil ys-live and scratch on the event vector (with-ys-checkpoint).

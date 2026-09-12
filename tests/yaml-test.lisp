@@ -180,15 +180,26 @@
         (ok (eq round (aref round 1)))))))
 
 (deftest yaml-events-smoke
-  (let ((ev (parse-events (format nil "a: &x 1~%b: *x~%"))))
-    (ok (vectorp ev))
-    (ok (equal '(:stream-start :document-start :mapping-start
-                 :scalar :scalar :scalar :alias
-                 :mapping-end :document-end :stream-end)
-               (map 'list #'yaml-event-kind ev)))
-    (ok (string= "x" (yaml-event-anchor (elt ev 4))))
-    (ok (string= "x" (yaml-event-value (elt ev 6))))
-    (ok (search "=ALI *x" (format-events ev)))))
+  (let* ((text (format nil "a: &x 1~%b: *x~%"))
+         (ev (parse-events text))
+         (kinds '(:stream-start :document-start :mapping-start
+                  :scalar :scalar :scalar :alias
+                  :mapping-end :document-end :stream-end))
+         (boxed (box-events ev)))
+    (ok (yaml-events-p ev))
+    (ok (= (length kinds) (yaml-events-count ev)))
+    (ok (equal kinds
+               (loop for i from 0 below (yaml-events-count ev)
+                     collect (event-kind ev i))))
+    (ok (string= "x" (event-anchor ev 4)))
+    (ok (string= "x" (event-value ev 6)))
+    (ok (search "=ALI *x" (format-events ev)))
+    (ok (search "=ALI *x" (format-events boxed)))
+    (ok (equal kinds (map 'list #'yaml-event-kind boxed)))
+    (let ((g1 (compose-events ev))
+          (g2 (compose-events boxed)))
+      (ok (%lisp= g1 g2))
+      (ok (eq (gethash "a" g1) (gethash "b" g1))))))
 
 (deftest yaml-json-fast-path-and-fallback
   "Strict JSON hits the fast path. YAML-only / leftover → full parser."
