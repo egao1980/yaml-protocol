@@ -1,0 +1,708 @@
+(in-package #:yaml-protocol)
+
+;;; YAML 1.2 parser. JSON is a subset (JSON schema); scalars use Core schema
+;;; (not YAML 1.1 — `NO` is a string). Same Lisp mapping as json-protocol:
+;;;   object → equal hash-table, string keys
+;;;   array  → vector
+;;;   null   → :null
+;;;   false  → nil    true → t
+
+(defstruct (ys (:constructor %make-ys))
+  (text "" :type string)
+  (pos 0 :type fixnum)
+  (len 0 :type fixnum)
+  (anchors nil))
+
+(defun make-ys (text)
+  (%make-ys :text text :pos 0 :len (length text)
+            :anchors (make-hash-table :test #'equal)))
+
+(defun ys-eof-p (ys)
+  (>= (ys-pos ys) (ys-len ys)))
+
+(defun ys-peek (ys &optional (n 0))
+  (let ((i (+ (ys-pos ys) n)))
+    (when (< i (ys-len ys))
+      (char (ys-text ys) i))))
+
+(defun ys-next (ys)
+  (when (< (ys-pos ys) (ys-len ys))
+    (prog1 (char (ys-text ys) (ys-pos ys))
+      (incf (ys-pos ys)))))
+
+(defun ys-column (ys)
+  (let ((text (ys-text ys))
+        (pos (ys-pos ys)))
+    (loop for i from (1- pos) downto 0
+          when (char= (char text i) #\Newline)
+            return (- pos i 1)
+          finally (return pos))))
+
+(defun %bom-p (ys)
+  (and (>= (- (ys-len ys) (ys-pos ys)) 1)
+       (char= (ys-peek ys) #\ufeff)))
+
+(defun skip-bom (ys)
+  (when (%bom-p ys)
+    (ys-next ys)))
+
+(defun space-p (c)
+  (or (eql c #\Space) (eql c #\Tab)))
+
+(defun break-p (c)
+  (or (eql c #\Newline) (eql c #\Return)))
+
+(defun skip-spaces (ys)
+  (loop while (space-p (ys-peek ys)) do (ys-next ys)))
+
+(defun skip-comment (ys)
+  (when (eql (ys-peek ys) #\#)
+    (loop until (or (ys-eof-p ys) (break-p (ys-peek ys)))
+          do (ys-next ys))))
+
+(defun skip-break (ys)
+  (cond
+    ((eql (ys-peek ys) #\Return)
+     (ys-next ys)
+     (when (eql (ys-peek ys) #\Newline)
+       (ys-next ys))
+     t)
+    ((eql (ys-peek ys) #\Newline)
+     (ys-next ys)
+     t)
+    (t nil)))
+
+(defun skip-ws-breaks (ys)
+  "Skip spaces, comments, and line breaks (flow / between nodes)."
+  (loop
+    (skip-spaces ys)
+    (cond
+      ((eql (ys-peek ys) #\#) (skip-comment ys))
+      ((skip-break ys))
+      (t (return)))))
+
+(defun at-marker-p (ys marker)
+  (let ((n (length marker)))
+    (loop for i below n
+          unless (eql (ys-peek ys i) (char marker i))
+            return nil
+          finally (let ((c (ys-peek ys n)))
+                    (return (or (null c) (space-p c) (break-p c)))))))
+
+(defun consume-marker (ys marker)
+  (dotimes (i (length marker))
+    (ys-next ys))
+  (skip-spaces ys)
+  (skip-comment ys))
+
+(defun fail-parse (ys fmt &rest args)
+  (error 'yaml-parse-error
+         :message (format nil "~A (pos ~D)"
+                          (apply #'format nil fmt args)
+                          (ys-pos ys))))
+
+(defun hex-digit-p (c)
+  (and c (or (char<= #\0 c #\9)
+             (char<= #\a c #\f)
+             (char<= #\A c #\F))))
+
+(defun parse-hex (ys n)
+  (let ((acc 0))
+    (dotimes (i n acc)
+      (let ((c (ys-next ys)))
+        (unless (hex-digit-p c)
+          (fail-parse ys "bad hex escape"))
+        (setf acc (+ (* acc 16)
+                     (digit-char-p c 16)))))))
+
+(defun parse-double-quoted (ys)
+  (unless (eql (ys-next ys) #\")
+    (fail-parse ys "expected \""))
+  (with-output-to-string (out)
+    (loop
+      (let ((c (ys-peek ys)))
+        (cond
+          ((null c) (fail-parse ys "unterminated double-quoted string"))
+          ((char= c #\")
+           (ys-next ys)
+           (return))
+          ((char= c #\\)
+           (ys-next ys)
+           (let ((e (ys-next ys)))
+             (when (null e)
+               (fail-parse ys "unterminated escape"))
+             (cond
+               ((char= e #\") (write-char #\" out))
+               ((char= e #\\) (write-char #\\ out))
+               ((char= e #\/) (write-char #\/ out))
+               ((char= e #\b) (write-char #\Backspace out))
+               ((char= e #\f) (write-char #\Page out))
+               ((char= e #\n) (write-char #\Newline out))
+               ((char= e #\r) (write-char #\Return out))
+               ((char= e #\t) (write-char #\Tab out))
+               ((char= e #\u)
+                (write-char (code-char (parse-hex ys 4)) out))
+               ((char= e #\U)
+                (write-char (code-char (parse-hex ys 8)) out))
+               ((char= e #\x)
+                (write-char (code-char (parse-hex ys 2)) out))
+               ((or (char= e #\Newline) (char= e #\Return))
+                ;; YAML escaped line break — fold away
+                (when (and (char= e #\Return) (eql (ys-peek ys) #\Newline))
+                  (ys-next ys))
+                (skip-spaces ys))
+               (t (write-char e out)))))
+          ((break-p c)
+           (skip-break ys)
+           (skip-spaces ys)
+           (write-char #\Space out))
+          (t
+           (write-char (ys-next ys) out)))))))
+
+(defun parse-single-quoted (ys)
+  (unless (eql (ys-next ys) #\')
+    (fail-parse ys "expected '"))
+  (with-output-to-string (out)
+    (loop
+      (let ((c (ys-peek ys)))
+        (cond
+          ((null c) (fail-parse ys "unterminated single-quoted string"))
+          ((char= c #\')
+           (ys-next ys)
+           (if (eql (ys-peek ys) #\')
+               (write-char (ys-next ys) out)
+               (return)))
+          ((break-p c)
+           (skip-break ys)
+           (skip-spaces ys)
+           (write-char #\Space out))
+          (t
+           (write-char (ys-next ys) out)))))))
+
+(defun %core-integer (s)
+  (let ((sign 1)
+        (start 0)
+        (n (length s)))
+    (when (zerop n)
+      (return-from %core-integer nil))
+    (cond
+      ((char= (char s 0) #\+) (setf start 1))
+      ((char= (char s 0) #\-) (setf start 1 sign -1)))
+    (when (>= start n)
+      (return-from %core-integer nil))
+    (cond
+      ((and (>= (- n start) 3)
+            (char= (char s start) #\0)
+            (or (char= (char s (1+ start)) #\x)
+                (char= (char s (1+ start)) #\X)))
+       (let ((rest (subseq s (+ start 2))))
+         (when (and (plusp (length rest))
+                    (every (lambda (c) (hex-digit-p c)) rest))
+           (* sign (parse-integer rest :radix 16)))))
+      ((and (>= (- n start) 3)
+            (char= (char s start) #\0)
+            (or (char= (char s (1+ start)) #\o)
+                (char= (char s (1+ start)) #\O)))
+       (let ((rest (subseq s (+ start 2))))
+         (when (and (plusp (length rest))
+                    (every (lambda (c) (char<= #\0 c #\7)) rest))
+           (* sign (parse-integer rest :radix 8)))))
+      ((and (char= (char s start) #\0) (= n (1+ start)))
+       0)
+      ((and (char<= #\1 (char s start) #\9)
+            (every #'digit-char-p (subseq s start)))
+       (* sign (parse-integer s :start start)))
+      (t nil))))
+
+(defun %core-float (s)
+  (let ((n (length s)))
+    (when (zerop n)
+      (return-from %core-float nil))
+    (flet ((inf-p (x)
+             (or (string= x ".inf") (string= x ".Inf") (string= x ".INF")
+                 (string= x "+.inf") (string= x "+.Inf") (string= x "+.INF")))
+           (ninf-p (x)
+             (or (string= x "-.inf") (string= x "-.Inf") (string= x "-.INF")))
+           (nan-p (x)
+             (or (string= x ".nan") (string= x ".NaN") (string= x ".NAN"))))
+      (cond
+        ((inf-p s) (if (boundp 'double-float-positive-infinity)
+                       double-float-positive-infinity
+                       most-positive-double-float))
+        ((ninf-p s) (if (boundp 'double-float-negative-infinity)
+                        double-float-negative-infinity
+                        most-negative-double-float))
+        ((nan-p s) (if (boundp 'double-float-nan)
+                       double-float-nan
+                       nil))
+        (t
+         ;; YAML 1.2 Core float / JSON number (scientific).
+         (when (and (find-if (lambda (c)
+                               (or (char= c #\.) (char= c #\e) (char= c #\E)))
+                             s)
+                    (every (lambda (c)
+                             (or (digit-char-p c)
+                                 (member c '(#\+ #\- #\. #\e #\E))))
+                           s))
+           (let* ((*read-default-float-format* 'double-float)
+                  (*read-eval* nil))
+             (ignore-errors
+               (let ((v (read-from-string s)))
+                 (and (numberp v) (float v 1.0d0)))))))))))
+
+(defun resolve-plain (s)
+  (cond
+    ((or (string= s "")
+         (string= s "~")
+         (string= s "null") (string= s "Null") (string= s "NULL"))
+     :null)
+    ((or (string= s "true") (string= s "True") (string= s "TRUE")) t)
+    ((or (string= s "false") (string= s "False") (string= s "FALSE")) nil)
+    (t
+     (or (%core-integer s)
+         (%core-float s)
+         s))))
+
+(defun plain-stop-p (c flow)
+  (or (null c)
+      (break-p c)
+      (eql c #\#)
+      (and flow (member c '(#\, #\[ #\] #\{ #\})))))
+
+(defun parse-plain (ys &key flow)
+  (with-output-to-string (out)
+    (loop
+      (let ((c (ys-peek ys)))
+        (cond
+          ((plain-stop-p c flow)
+           (return))
+          ((and (eql c #\:)
+                (let ((n (ys-peek ys 1)))
+                  (or (null n) (space-p n) (break-p n)
+                      (and flow (member n '(#\, #\] #\}))))))
+           (return))
+          ((and (space-p c)
+                (eql (ys-peek ys 1) #\#))
+           (return))
+          ((space-p c)
+           (write-char (ys-next ys) out))
+          (t
+           (write-char (ys-next ys) out)))))
+    ;; trim trailing spaces collected before a comment / colon
+    ))
+
+(defun rtrim-spaces (s)
+  (let ((end (length s)))
+    (loop while (and (plusp end) (space-p (char s (1- end))))
+          do (decf end))
+    (if (= end (length s))
+        s
+        (subseq s 0 end))))
+
+(defun parse-plain-scalar (ys &key flow)
+  (resolve-plain (rtrim-spaces (parse-plain ys :flow flow))))
+
+(defun parse-block-scalar (ys)
+  (let ((kind (ys-next ys))
+        (chomp :clip)
+        (explicit-indent nil))
+    (unless (or (char= kind #\|) (char= kind #\>))
+      (fail-parse ys "expected block scalar"))
+    (loop
+      (let ((c (ys-peek ys)))
+        (cond
+          ((eql c #\-) (ys-next ys) (setf chomp :strip))
+          ((eql c #\+) (ys-next ys) (setf chomp :keep))
+          ((and c (char<= #\1 c #\9))
+           (setf explicit-indent (digit-char-p (ys-next ys))))
+          (t (return)))))
+    (skip-spaces ys)
+    (skip-comment ys)
+    (unless (or (ys-eof-p ys) (break-p (ys-peek ys)))
+      (fail-parse ys "trailing junk after block scalar header"))
+    (skip-break ys)
+    (let* ((parent-col (ys-column ys))
+           (content-indent (or (and explicit-indent
+                                    (+ parent-col explicit-indent))
+                               nil))
+           (lines '()))
+      (loop
+        (when (ys-eof-p ys)
+          (return))
+        (let ((col 0))
+          (loop while (eql (ys-peek ys) #\Space)
+                do (ys-next ys) (incf col))
+          (cond
+            ((or (ys-eof-p ys) (break-p (ys-peek ys)))
+             (push "" lines)
+             (skip-break ys))
+            ((eql (ys-peek ys) #\#)
+             ;; comment-only line at or below parent — end
+             (when (and content-indent (< col content-indent))
+               (return))
+             (skip-comment ys)
+             (skip-break ys))
+            (t
+             (unless content-indent
+               (setf content-indent col))
+             (when (< col content-indent)
+               ;; rewind spaces so the next node sees them
+               (decf (ys-pos ys) col)
+               (return))
+             (dotimes (i (- col content-indent))
+               (declare (ignore i)))
+             (let ((extra (- col content-indent)))
+               (push (concatenate 'string
+                                  (make-string extra :initial-element #\Space)
+                                  (with-output-to-string (o)
+                                    (loop until (or (ys-eof-p ys) (break-p (ys-peek ys)))
+                                          do (write-char (ys-next ys) o))))
+                     lines)
+               (skip-break ys))))))
+      (setf lines (nreverse lines))
+      (let ((text (if (char= kind #\|)
+                      (%join-literal lines)
+                      (%join-folded lines))))
+        (%apply-chomp text chomp)))))
+
+(defun %join-literal (lines)
+  (format nil "~{~A~^~%~}" lines))
+
+(defun %join-folded (lines)
+  (with-output-to-string (out)
+    (let ((prev-empty t)
+          (first t))
+      (dolist (line lines)
+        (let ((empty (zerop (length line))))
+          (cond
+            (empty
+             (write-char #\Newline out)
+             (setf prev-empty t))
+            (t
+             (unless first
+               (write-char (if prev-empty #\Newline #\Space) out))
+             (write-string line out)
+             (setf prev-empty nil first nil))))))))
+
+(defun %apply-chomp (text chomp)
+  (ecase chomp
+    (:keep text)
+    (:strip
+     (let ((end (length text)))
+       (loop while (and (plusp end) (char= (char text (1- end)) #\Newline))
+             do (decf end))
+       (subseq text 0 end)))
+    (:clip
+     (let ((stripped (%apply-chomp text :strip)))
+       (if (plusp (length text))
+           (concatenate 'string stripped (string #\Newline))
+           stripped)))))
+
+(defun skip-anchor-name (ys)
+  (with-output-to-string (o)
+    (loop for c = (ys-peek ys)
+          while (and c (not (space-p c)) (not (break-p c))
+                     (not (member c '(#\[ #\] #\{ #\} #\, #\:))))
+          do (write-char (ys-next ys) o))))
+
+(defun parse-properties (ys)
+  "Optional &anchor / !tag. Returns (values anchor tag)."
+  (let ((anchor nil)
+        (tag nil))
+    (loop
+      (skip-spaces ys)
+      (cond
+        ((eql (ys-peek ys) #\&)
+         (ys-next ys)
+         (setf anchor (skip-anchor-name ys)))
+        ((eql (ys-peek ys) #\!)
+         (ys-next ys)
+         (setf tag (skip-anchor-name ys)))
+        (t (return))))
+    (values anchor tag)))
+
+(defun maybe-alias (ys)
+  (when (eql (ys-peek ys) #\*)
+    (ys-next ys)
+    (let* ((name (skip-anchor-name ys))
+           (val (gethash name (ys-anchors ys) :missing)))
+      (when (eq val :missing)
+        (fail-parse ys "unknown alias *~A" name))
+      val)))
+
+(defun store-anchor (ys anchor value)
+  (when (and anchor (plusp (length anchor)))
+    (setf (gethash anchor (ys-anchors ys)) value))
+  value)
+
+(defun parse-flow-seq (ys)
+  (unless (eql (ys-next ys) #\[)
+    (fail-parse ys "expected ["))
+  (skip-ws-breaks ys)
+  (when (eql (ys-peek ys) #\])
+    (ys-next ys)
+    (return-from parse-flow-seq (make-array 0)))
+  (let ((items '()))
+    (loop
+      (skip-ws-breaks ys)
+      (push (parse-node ys :flow t) items)
+      (skip-ws-breaks ys)
+      (cond
+        ((eql (ys-peek ys) #\])
+         (ys-next ys)
+         (return))
+        ((eql (ys-peek ys) #\,)
+         (ys-next ys)
+         (skip-ws-breaks ys)
+         (when (eql (ys-peek ys) #\])
+           (ys-next ys)
+           (return)))
+        (t (fail-parse ys "expected , or ] in flow sequence"))))
+    (coerce (nreverse items) 'vector)))
+
+(defun parse-flow-map (ys)
+  (unless (eql (ys-next ys) #\{)
+    (fail-parse ys "expected {"))
+  (skip-ws-breaks ys)
+  (let ((ht (make-hash-table :test #'equal)))
+    (when (eql (ys-peek ys) #\})
+      (ys-next ys)
+      (return-from parse-flow-map ht))
+    (loop
+      (skip-ws-breaks ys)
+      (when (eql (ys-peek ys) #\})
+        (ys-next ys)
+        (return ht))
+      (let ((key (stringify-key (parse-node ys :flow t :key t))))
+        (skip-ws-breaks ys)
+        (unless (eql (ys-peek ys) #\:)
+          (fail-parse ys "expected : in flow mapping"))
+        (ys-next ys)
+        (skip-ws-breaks ys)
+        (let ((val (if (or (eql (ys-peek ys) #\,) (eql (ys-peek ys) #\}))
+                       :null
+                       (parse-node ys :flow t))))
+          (assign-map-entry ht key val)))
+      (skip-ws-breaks ys)
+      (cond
+        ((eql (ys-peek ys) #\})
+         (ys-next ys)
+         (return ht))
+        ((eql (ys-peek ys) #\,)
+         (ys-next ys))
+        (t (fail-parse ys "expected , or } in flow mapping"))))
+    ht))
+
+(defun stringify-key (key)
+  (cond
+    ((stringp key) key)
+    ((eq key :null) "null")
+    ((eq key t) "true")
+    ((null key) "false")
+    ((numberp key) (princ-to-string key))
+    (t (princ-to-string key))))
+
+(defun merge-mapping (dest src)
+  "YAML merge key << — entity-ref composition. Existing keys win."
+  (cond
+    ((hash-table-p src)
+     (maphash (lambda (k v)
+                (unless (nth-value 1 (gethash k dest))
+                  (setf (gethash k dest) v)))
+              src))
+    ((and (vectorp src) (not (stringp src)))
+     (loop for i from (1- (length src)) downto 0
+           do (merge-mapping dest (aref src i))))
+    (t (error 'yaml-parse-error :message "<< merge value must be a mapping"))))
+
+(defun assign-map-entry (ht key val)
+  (if (string= key "<<")
+      (merge-mapping ht val)
+      (setf (gethash key ht) val)))
+
+(defun looks-like-block-map-p (ys)
+  (let ((saved (ys-pos ys)))
+    (unwind-protect
+         (progn
+           (cond
+             ((eql (ys-peek ys) #\")
+              (ignore-errors (parse-double-quoted ys)))
+             ((eql (ys-peek ys) #\')
+              (ignore-errors (parse-single-quoted ys)))
+             (t
+              (loop
+                (let ((c (ys-peek ys)))
+                  (cond
+                    ((or (null c) (break-p c) (eql c #\#))
+                     (return))
+                    ((and (eql c #\:)
+                          (let ((n (ys-peek ys 1)))
+                            (or (null n) (space-p n) (break-p n))))
+                     (return))
+                    (t (ys-next ys)))))))
+           (skip-spaces ys)
+           (eql (ys-peek ys) #\:))
+      (setf (ys-pos ys) saved))))
+
+(defun parse-block-seq (ys)
+  (let ((indent (ys-column ys))
+        (items '()))
+    (loop
+      (skip-spaces ys)
+      (when (or (ys-eof-p ys) (at-marker-p ys "---") (at-marker-p ys "..."))
+        (return))
+      (let ((col (ys-column ys)))
+        (cond
+          ((< col indent)
+           (return))
+          ((> col indent)
+           (fail-parse ys "bad sequence indent"))
+          ((not (eql (ys-peek ys) #\-))
+           (return))
+          (t
+           (ys-next ys)
+           (cond
+             ((or (ys-eof-p ys) (break-p (ys-peek ys)) (eql (ys-peek ys) #\#))
+              (skip-comment ys)
+              (skip-break ys)
+              (skip-ws-breaks ys)
+              (if (and (not (ys-eof-p ys))
+                       (not (at-marker-p ys "---"))
+                       (not (at-marker-p ys "..."))
+                       (> (ys-column ys) indent))
+                  (push (parse-node ys) items)
+                  (push :null items)))
+             ((space-p (ys-peek ys))
+              (skip-spaces ys)
+              (if (or (ys-eof-p ys) (break-p (ys-peek ys)) (eql (ys-peek ys) #\#))
+                  (progn
+                    (skip-comment ys)
+                    (skip-break ys)
+                    (skip-ws-breaks ys)
+                    (push (if (and (not (ys-eof-p ys))
+                                   (> (ys-column ys) indent))
+                              (parse-node ys)
+                              :null)
+                          items))
+                  (push (parse-node ys) items)))
+             (t
+              ;; `-foo` is a plain scalar, not a sequence entry
+              (decf (ys-pos ys))
+              (return))))))
+      (skip-ws-breaks ys)
+      (when (and (not (ys-eof-p ys))
+                 (< (ys-column ys) indent))
+        (return)))
+    (coerce (nreverse items) 'vector)))
+
+(defun parse-block-map (ys)
+  (let ((indent (ys-column ys))
+        (ht (make-hash-table :test #'equal)))
+    (loop
+      (skip-spaces ys)
+      (when (or (ys-eof-p ys)
+                (at-marker-p ys "---")
+                (at-marker-p ys "..."))
+        (return))
+      (let ((col (ys-column ys)))
+        (when (< col indent)
+          (return))
+        (when (and (eql (ys-peek ys) #\-) (space-p (ys-peek ys 1)))
+          (return))
+        (unless (= col indent)
+          (return))
+        (let ((key (stringify-key
+                    (cond
+                      ((eql (ys-peek ys) #\") (parse-double-quoted ys))
+                      ((eql (ys-peek ys) #\') (parse-single-quoted ys))
+                      (t (parse-plain-scalar ys))))))
+          (skip-spaces ys)
+          (unless (eql (ys-peek ys) #\:)
+            (fail-parse ys "expected : after mapping key"))
+          (ys-next ys)
+          (skip-spaces ys)
+          (skip-comment ys)
+          (let ((val (cond
+                       ((or (ys-eof-p ys) (break-p (ys-peek ys)))
+                        (skip-break ys)
+                        (skip-ws-breaks ys)
+                        (if (and (not (ys-eof-p ys))
+                                 (not (at-marker-p ys "---"))
+                                 (not (at-marker-p ys "..."))
+                                 (> (ys-column ys) indent))
+                            (parse-node ys)
+                            :null))
+                       (t (parse-node ys)))))
+            (assign-map-entry ht key val))))
+      (skip-ws-breaks ys))
+    ht))
+
+(defun parse-node (ys &key flow key)
+  (declare (ignore key))
+  (let ((alias (maybe-alias ys)))
+    (when alias
+      (return-from parse-node alias)))
+  (multiple-value-bind (anchor tag)
+      (parse-properties ys)
+    (declare (ignore tag))
+    (skip-spaces ys)
+    (skip-comment ys)
+    (when (or (break-p (ys-peek ys)) (ys-eof-p ys))
+      (skip-break ys)
+      (skip-ws-breaks ys))
+    (let ((value
+            (let ((c (ys-peek ys)))
+              (cond
+                ((null c) :null)
+                ((eql c #\{) (parse-flow-map ys))
+                ((eql c #\[) (parse-flow-seq ys))
+                ((or (eql c #\|) (eql c #\>)) (parse-block-scalar ys))
+                ((eql c #\") (parse-double-quoted ys))
+                ((eql c #\') (parse-single-quoted ys))
+                ((and (not flow)
+                      (eql c #\-)
+                      (let ((n (ys-peek ys 1)))
+                        (or (null n) (space-p n) (break-p n))))
+                 (parse-block-seq ys))
+                ((and (not flow) (looks-like-block-map-p ys))
+                 (parse-block-map ys))
+                (t (parse-plain-scalar ys :flow flow))))))
+      (store-anchor ys anchor value)
+      value)))
+
+(defun parse-document (ys)
+  (skip-ws-breaks ys)
+  (when (at-marker-p ys "---")
+    (consume-marker ys "---")
+    (skip-ws-breaks ys))
+  (when (or (ys-eof-p ys) (at-marker-p ys "..."))
+    (when (at-marker-p ys "...")
+      (consume-marker ys "..."))
+    (return-from parse-document :null))
+  (let ((doc (parse-node ys)))
+    (skip-ws-breaks ys)
+    (when (at-marker-p ys "...")
+      (consume-marker ys "..."))
+    doc))
+
+(defun parse-yaml (text &key all)
+  (let ((ys (make-ys text)))
+    (skip-bom ys)
+    (if (not all)
+        (progn
+          (skip-ws-breaks ys)
+          (if (ys-eof-p ys)
+              :null
+              (parse-document ys)))
+        (let ((docs '()))
+          (loop
+            (skip-ws-breaks ys)
+            (when (ys-eof-p ys)
+              (return))
+            (push (parse-document ys) docs)
+            (skip-ws-breaks ys)
+            (cond
+              ((ys-eof-p ys) (return))
+              ((at-marker-p ys "---"))
+              (t (return))))
+          (coerce (nreverse docs) 'vector)))))
