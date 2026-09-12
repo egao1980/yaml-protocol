@@ -362,7 +362,7 @@
           (push #\Newline chars))
         (progn (push #\Space chars) chars))))
 
-(defun parse-double-quoted (ys &key (indent -1))
+(defun parse-double-quoted (ys &key (indent -1) single-line)
   (unless (eql (ys-next ys) #\")
     (fail-parse ys "expected \""))
   (let ((chars '()))
@@ -373,7 +373,7 @@
           ((char= c #\")
            (ys-next ys)
            (return (coerce (nreverse chars) 'string)))
-          ((at-marker-p ys "---")
+          ((or (at-marker-p ys "---") (at-marker-p ys "..."))
            (fail-parse ys "document marker inside double-quoted scalar"))
           ((char= c #\\)
            (ys-next ys)
@@ -384,11 +384,13 @@
                          do (ys-next ys)))
                  (push x chars))))
           ((break-p c)
+           (when single-line
+             (fail-parse ys "multiline implicit key"))
            (setf chars (fold-flow-break ys chars indent)))
           (t
            (push (ys-next ys) chars)))))))
 
-(defun parse-single-quoted (ys &key (indent -1))
+(defun parse-single-quoted (ys &key (indent -1) single-line)
   (unless (eql (ys-next ys) #\')
     (fail-parse ys "expected '"))
   (let ((chars '()))
@@ -402,6 +404,8 @@
                (push (ys-next ys) chars)
                (return (coerce (nreverse chars) 'string))))
           ((break-p c)
+           (when single-line
+             (fail-parse ys "multiline implicit key"))
            (setf chars (fold-flow-break ys chars indent)))
           (t
            (push (ys-next ys) chars)))))))
@@ -416,11 +420,13 @@
     (or (null n) (blank-p n) (break-p n)
         (and flow (member n '(#\, #\] #\}))))))
 
-(defun parse-plain (ys &key flow (indent -1))
+(defun parse-plain (ys &key flow (indent -1) single-line)
   (let ((chars '()))
     (loop
       (let ((c (ys-peek ys)))
         (cond
+          ((and (break-p c) single-line)
+           (return))
           ((and (break-p c) (not flow))
            (let ((saved (ys-pos ys))
                  (saved-chars chars))
@@ -698,6 +704,8 @@
       (ys-next ys)
       (emit ys :sequence-end)
       (return))
+    (when (eql (ys-peek ys) #\,)
+      (fail-parse ys "empty entry in flow sequence"))
     (if (looks-like-flow-pair-p ys)
         (parse-flow-pair ys)
         (parse-node ys :flow t :indent -1))
@@ -710,6 +718,8 @@
       ((eql (ys-peek ys) #\,)
        (ys-next ys)
        (skip-ws-breaks ys)
+       (when (eql (ys-peek ys) #\,)
+         (fail-parse ys "empty entry in flow sequence"))
        (when (eql (ys-peek ys) #\])
          (ys-next ys)
          (emit ys :sequence-end)
@@ -814,6 +824,12 @@
       (skip-ws-breaks ys))
     (emit ys :sequence-end)))
 
+(defun parse-block-map-same-line-value (ys indent)
+  "Reject compact `key: - item` (5U3A)."
+  (when (looks-like-block-seq-p ys)
+    (fail-parse ys "block sequence on the same line as mapping key"))
+  (parse-node ys :indent indent))
+
 (defun block-value-here-p (ys indent)
   "After `key:\\n`, a same-indent block sequence is the value (`key:\\n- item`).
    A same-indent mapping key is the next entry, not the value (6KGN)."
@@ -892,7 +908,7 @@
               (if (block-value-here-p ys indent)
                   (parse-node ys :indent indent)
                   (emit-scalar ys "")))
-             (t (parse-node ys :indent indent))))))
+             (t (parse-block-map-same-line-value ys indent))))))
       (skip-ws-breaks ys))
     (emit ys :mapping-end)))
 
@@ -944,13 +960,19 @@
                  (emit-scalar ys "" :anchor anchor :tag tag)
                  (collection #'parse-block-map)))
             ((eql c #\")
-             (emit-scalar ys (parse-double-quoted ys :indent indent)
+             (emit-scalar ys (parse-double-quoted ys :indent indent
+                                                 :single-line (and (eq key :implicit)
+                                                                   (not flow)))
                           :anchor anchor :tag tag :style :double))
             ((eql c #\')
-             (emit-scalar ys (parse-single-quoted ys :indent indent)
+             (emit-scalar ys (parse-single-quoted ys :indent indent
+                                                 :single-line (and (eq key :implicit)
+                                                                   (not flow)))
                           :anchor anchor :tag tag :style :single))
             (t
-             (let ((plain (parse-plain ys :flow flow :indent indent)))
+             (let ((plain (parse-plain ys :flow flow :indent indent
+                                       :single-line (and (eq key :implicit)
+                                                         (not flow)))))
                (emit-scalar ys plain :anchor anchor :tag tag :style :plain)))))))))
 
 (defun parse-directive-line (ys)
@@ -1017,6 +1039,8 @@
       (consume-marker ys "---")
       (setf explicit-start t)
       (skip-ws-breaks ys))
+    (when (and had-directives (not explicit-start))
+      (fail-parse ys "directives require a document start marker"))
     (when (and (not explicit-start)
                (not had-directives)
                (or (ys-eof-p ys)
