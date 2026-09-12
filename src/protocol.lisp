@@ -72,7 +72,7 @@
                   collect v)))))
 
 (defun parse-events (source)
-  "Parse SOURCE to a vector of YAML-EVENT (yaml-test-suite event DSL).")
+  "Parse SOURCE to a vector of YAML-EVENT (yaml-test-suite event DSL)."
   (unless *yaml-backend*
     (error 'yaml-parse-error :message "*yaml-backend* is unbound — load yaml-protocol"))
   (handler-case
