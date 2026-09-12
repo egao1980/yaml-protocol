@@ -453,7 +453,7 @@
       (s-indent ys)
       (when (and (eql (ys-peek ys) #\Tab)
                  (>= indent 0)
-                 (<= (ys-column ys) indent))
+                 (< (ys-column ys) indent))
         (fail-parse ys "tab used as indentation"))
       (s-separate-in-line ys)
       (cond
@@ -466,7 +466,7 @@
       (when (and (not (null c))
                  (not (b-break-p c))
                  (>= indent 0)
-                 (<= (ys-column ys) indent))
+                 (< (ys-column ys) indent))
         (fail-parse ys "wrong indent in flow/quoted")))
     (if (plusp empty)
         (dotimes (i empty chars)
@@ -501,7 +501,11 @@
              (ys-next ys)
              (let ((x (dq-unescape ys)))
                (if (eq x :escaped-break)
-                   nil
+                   (when (plusp indent)
+                     (dotimes (i indent)
+                       (unless (s-space-p (ys-peek ys))
+                         (return))
+                       (ys-next ys)))
                    (push x chars))))
             ((b-break-p c)
              (when single-line
@@ -921,7 +925,7 @@
     (when (and c
                (not (member c '(#\] #\})))
                (>= indent 0)
-               (<= (ys-column ys) indent))
+               (< (ys-column ys) indent))
       (fail-parse ys "wrong indent in flow"))))
 
 (defun c-flow-sequence (ys &key anchor tag (indent -1))
@@ -1236,12 +1240,15 @@
                (block-coll-ok ()
                  (and (not flow)
                       (not (eq key :implicit))
-                      (or broke (not doc-same-line)))))
+                      (or broke (not doc-same-line))))
+               (flow-n ()
+                 "[201] s-l+flow-in-block(n) uses n+1; in-flow keeps n."
+                 (if flow indent (1+ indent))))
           (cond
             ((and flow (c-forbidden-p ys))
              (fail-parse ys "document marker in flow"))
             ((or (null c)
-                 (and flow (c-flow-indicator-p c))
+                 (and flow (member c '(#\, #\] #\})))
                  (and (eql c #\:) (colon-ends-plain-p ys flow)
                       (or flow
                           (eq key :implicit)
@@ -1257,8 +1264,8 @@
              (if (and (block-coll-ok) (looks-like-block-map-p ys))
                  (collection #'l+block-mapping)
                  (if (eql c #\{)
-                     (c-flow-mapping ys :anchor anchor :tag tag :indent indent)
-                     (c-flow-sequence ys :anchor anchor :tag tag :indent indent))))
+                     (c-flow-mapping ys :anchor anchor :tag tag :indent (flow-n))
+                     (c-flow-sequence ys :anchor anchor :tag tag :indent (flow-n)))))
             ((or (eql c #\|) (eql c #\>))
              (multiple-value-bind (text style)
                  (l+block-scalar ys :indent indent)
@@ -1272,17 +1279,17 @@
                  (emit-scalar ys "" :anchor anchor :tag tag)
                  (collection #'l+block-mapping)))
             ((eql c #\")
-             (emit-scalar ys (parse-double-quoted ys :indent indent
+             (emit-scalar ys (parse-double-quoted ys :indent (flow-n)
                                                  :single-line (and (eq key :implicit)
                                                                    (not flow)))
                           :anchor anchor :tag tag :style :double))
             ((eql c #\')
-             (emit-scalar ys (parse-single-quoted ys :indent indent
+             (emit-scalar ys (parse-single-quoted ys :indent (flow-n)
                                                  :single-line (and (eq key :implicit)
                                                                    (not flow)))
                           :anchor anchor :tag tag :style :single))
             ((ns-plain-first-p ys flow)
-             (emit-scalar ys (ns-plain ys :flow flow :indent indent
+             (emit-scalar ys (ns-plain ys :flow flow :indent (flow-n)
                                        :single-line (eq key :implicit))
                           :anchor anchor :tag tag :style :plain))
             (t
