@@ -501,11 +501,10 @@
              (ys-next ys)
              (let ((x (dq-unescape ys)))
                (if (eq x :escaped-break)
-                   (when (plusp indent)
-                     (dotimes (i indent)
-                       (unless (s-space-p (ys-peek ys))
-                         (return))
-                       (ys-next ys)))
+                   ;; [116] s-double-escaped → s-flow-line-prefix = s-indent (spaces).
+                   ;; Leading spaces are prefix (565N); `\`+space after that is content (NP9H).
+                   (loop while (s-space-p (ys-peek ys))
+                         do (ys-next ys))
                    (push x chars))))
             ((b-break-p c)
              (when single-line
