@@ -53,6 +53,11 @@
   (ok (string= "NO" (decode "NO")))
   (ok (string= "Yes" (decode "Yes"))))
 
+(deftest yaml-nonspecific-tag-is-string
+  "[100] c-non-specific-tag `!` resolves to str (S4JQ)."
+  (ok (equalp #("12" 12 "12")
+              (decode (format nil "- \"12\"~%- 12~%- ! 12~%")))))
+
 (deftest yaml-core-bools
   (ok (eq t (decode "true")))
   (ok (eq nil (decode "false")))

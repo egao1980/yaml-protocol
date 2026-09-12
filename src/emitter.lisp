@@ -123,8 +123,8 @@
                            (char= c #\{) (char= c #\}) (char= c #\[)
                            (char= c #\]) (char= c #\,)))
                      s))
-       (not (space-p (char s 0)))
-       (not (space-p (char s (1- (length s)))))
+       (not (s-space-p (char s 0)))
+       (not (s-space-p (char s (1- (length s)))))
        (let ((resolved (resolve-plain s)))
          (stringp resolved))))
 

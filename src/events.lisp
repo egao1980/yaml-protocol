@@ -214,11 +214,10 @@
        (if (eq style :plain)
            (resolve-plain raw)
            raw))
+      ;; [100] c-non-specific-tag `!` → tag:yaml.org,2002:str (JSON/Core).
       ((or (string= tag "!")
            (string= tag "tag:yaml.org,2002:str"))
-       (if (and (string= tag "!") (eq style :plain))
-           (resolve-plain raw)
-           raw))
+       raw)
       ((string= tag "tag:yaml.org,2002:null")
        :null)
       ((string= tag "tag:yaml.org,2002:bool")

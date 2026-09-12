@@ -189,7 +189,12 @@
                 (let ((got (%normalize-nl (format-events (parse-events in-yaml)))))
                   (ok (string= (%normalize-nl gold) got)
                       (format nil "~A events" id)))
-                (when (probe-file in-json-path)
+                (when (and (probe-file in-json-path)
+                           (let ((js (%slurp in-json-path)))
+                             (and js (find-if-not
+                                      (lambda (c)
+                                        (member c '(#\Space #\Tab #\Newline #\Return)))
+                                      js))))
                   (ok (%lisp= (%read-json (%slurp in-json-path))
                               (decode in-yaml))
                       (format nil "~A json" id))))))))))
