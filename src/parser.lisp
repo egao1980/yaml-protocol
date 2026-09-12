@@ -582,7 +582,7 @@
                (let ((col (ys-column ys))
                      (n (ys-peek ys)))
                  (when (or (null n)
-                           (< col indent)
+                           (<= col indent)
                            (c-forbidden-p ys)
                            (c-nb-comment-text-p ys)
                            (and flow (c-flow-indicator-p n))
