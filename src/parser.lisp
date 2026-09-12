@@ -450,7 +450,9 @@
   (let ((empty 0))
     (loop
       (s-indent ys)
-      (when (and (eql (ys-peek ys) #\Tab) (< (ys-column ys) indent))
+      (when (and (eql (ys-peek ys) #\Tab)
+                 (>= indent 0)
+                 (<= (ys-column ys) indent))
         (fail-parse ys "tab used as indentation"))
       (s-separate-in-line ys)
       (cond
@@ -474,32 +476,43 @@
   (s-flow-folded ys chars indent))
 
 (defun parse-double-quoted (ys &key (indent -1) single-line)
+  "[107] nb-double-text. Trailing s-white before a break is [73] s-separate-in-line
+   (DE56/04); escaped tabs are already ns-esc-char and stay (DE56/00)."
   (unless (eql (ys-next ys) #\")
     (fail-parse ys "expected \""))
-  (let ((chars '()))
-    (loop
-      (let ((c (ys-peek ys)))
-        (cond
-          ((null c) (fail-parse ys "unterminated double-quoted string"))
-          ((char= c #\")
-           (ys-next ys)
-           (return (coerce (nreverse chars) 'string)))
-          ((or (at-marker-p ys "---") (at-marker-p ys "..."))
-           (fail-parse ys "document marker inside double-quoted scalar"))
-          ((char= c #\\)
-           (ys-next ys)
-           (let ((x (dq-unescape ys)))
-             (if (eq x :escaped-break)
-                 (progn
-                   (loop while (blank-p (ys-peek ys))
-                         do (ys-next ys)))
-                 (push x chars))))
-          ((break-p c)
-           (when single-line
-             (fail-parse ys "multiline implicit key"))
-           (setf chars (fold-flow-break ys chars indent)))
-          (t
-           (push (ys-next ys) chars)))))))
+  (let ((chars '())
+        (pending '()))
+    (flet ((flush-pending ()
+             (dolist (w pending)
+               (push w chars))
+             (setf pending nil)))
+      (loop
+        (let ((c (ys-peek ys)))
+          (cond
+            ((null c) (fail-parse ys "unterminated double-quoted string"))
+            ((char= c #\")
+             (flush-pending)
+             (ys-next ys)
+             (return (coerce (nreverse chars) 'string)))
+            ((c-forbidden-p ys)
+             (fail-parse ys "document marker inside double-quoted scalar"))
+            ((char= c #\\)
+             (flush-pending)
+             (ys-next ys)
+             (let ((x (dq-unescape ys)))
+               (if (eq x :escaped-break)
+                   (s-separate-in-line ys)
+                   (push x chars))))
+            ((b-break-p c)
+             (when single-line
+               (fail-parse ys "multiline implicit key"))
+             (setf pending nil)
+             (setf chars (s-flow-folded ys chars indent)))
+            ((s-white-p c)
+             (push (ys-next ys) pending))
+            (t
+             (flush-pending)
+             (push (ys-next ys) chars))))))))
 
 (defun parse-single-quoted (ys &key (indent -1) single-line)
   (unless (eql (ys-next ys) #\')
@@ -514,7 +527,9 @@
            (if (eql (ys-peek ys) #\')
                (push (ys-next ys) chars)
                (return (coerce (nreverse chars) 'string))))
-          ((break-p c)
+          ((c-forbidden-p ys)
+           (fail-parse ys "document marker inside single-quoted scalar"))
+          ((b-break-p c)
            (when single-line
              (fail-parse ys "multiline implicit key"))
            (setf chars (fold-flow-break ys chars indent)))
@@ -621,8 +636,8 @@
           (t (return)))))
     (unless (s-b-comment ys)
       (fail-parse ys "trailing junk after block scalar header"))
-    (b-as-line-feed ys)
-    (values chomp explicit-indent)))
+    (let ((header-break (b-as-line-feed ys)))
+      (values chomp explicit-indent header-break))))
 
 (defun l+block-scalar (ys &key (indent -1))
   "[170]/[174] c-l+literal / c-l+folded. Parent n may be -1 (l-bare-document).
@@ -631,7 +646,7 @@
   (let ((kind (ys-next ys)))
     (unless (or (char= kind #\|) (char= kind #\>))
       (fail-parse ys "expected block scalar"))
-    (multiple-value-bind (chomp explicit-indent)
+    (multiple-value-bind (chomp explicit-indent header-break)
         (c-b-block-header ys)
       (let* ((parent indent)
              (content-indent (and explicit-indent (+ (max parent 0) explicit-indent)))
@@ -687,7 +702,7 @@
         (let ((text (if (char= kind #\|)
                         (%join-literal lines)
                         (%join-folded lines))))
-          (values (%apply-chomp text chomp)
+          (values (%apply-chomp text chomp :header-break header-break)
                   (if (char= kind #\|) :literal :folded)))))))
 
 (defun parse-block-scalar (ys &key (indent -1))
@@ -703,11 +718,12 @@
           (write-char #\Newline o)))))
 
 (defun %join-folded (lines)
-  "[176] l-nb-diff-lines / [172]–[175]. Empty after more-indent does not
-   add a third newline before the next more-indented line (7T8X)."
+  "[176] l-nb-diff-lines / [172]–[175]. Extra blank after more-indent only
+   when the next non-empty line is folded, not more-indented (7T8X vs 6VJK)."
   (with-output-to-string (out)
     (let ((prev-empty t)
           (prev-more nil)
+          (blank-after-more nil)
           (first t))
       (dolist (line lines)
         (let ((empty (zerop (length line)))
@@ -717,25 +733,26 @@
             (empty
              (write-char #\Newline out)
              (when prev-more
-               (write-char #\Newline out))
+               (setf blank-after-more t))
              (setf prev-empty t prev-more nil))
             (more
-             (unless (or first prev-empty)
+             (unless first
                (write-char #\Newline out))
              (write-string line out)
-             (setf prev-empty nil first nil prev-more t))
+             (setf prev-empty nil first nil prev-more t blank-after-more nil))
             (t
              (unless first
                (cond
+                 (blank-after-more (write-char #\Newline out))
                  (prev-empty)
                  (prev-more (write-char #\Newline out))
                  (t (write-char #\Space out))))
              (write-string line out)
-             (setf prev-empty nil first nil prev-more nil))))))))
+             (setf prev-empty nil first nil prev-more nil blank-after-more nil))))))))
 
-(defun %apply-chomp (text chomp)
+(defun %apply-chomp (text chomp &key header-break)
   "[163]–[167] c-chomping-indicator / l-chomped-empty.
-   Empty keep still keeps the header's final break (K858)."
+   Empty keep keeps the header break when it exists (K858 vs 2G84/03)."
   (flet ((strip-nl (s)
            (let ((end (length s)))
              (loop while (and (plusp end) (char= (char s (1- end)) #\Newline))
@@ -744,7 +761,8 @@
     (ecase chomp
       (:keep
        (cond
-         ((zerop (length text)) (string #\Newline))
+         ((zerop (length text))
+          (if header-break (string #\Newline) ""))
          ((char= (char text (1- (length text))) #\Newline) text)
          (t (concatenate 'string text (string #\Newline)))))
       (:strip (strip-nl text))
@@ -759,10 +777,12 @@
        (let ((n (ys-peek ys 1)))
          (or (null n) (blank-p n) (break-p n) (eql n #\#)))))
 
-(defun looks-like-explicit-key-p (ys)
+(defun looks-like-explicit-key-p (ys &optional flow)
+  "[155] c-mapping-key. In flow, `?` may sit against `,` `]` `}` (DFF7)."
   (and (eql (ys-peek ys) #\?)
        (let ((n (ys-peek ys 1)))
-         (or (null n) (blank-p n) (break-p n) (eql n #\#)))))
+         (or (null n) (s-white-p n) (b-break-p n) (eql n #\#)
+             (and flow (c-flow-indicator-p n))))))
 
 (defun looks-like-block-map-p (ys)
   "[187] l+block-mapping — implicit key may be a flow node (LX3P, Q9WF)."
@@ -780,9 +800,19 @@
            (ys-next ys)
            (ignore-errors (parse-anchor-name ys)))
           ((eql (ys-peek ys) #\[)
-           (ignore-errors (parse-flow-seq ys)))
+           (let ((start (ys-pos ys)))
+             (unless (ignore-errors (parse-flow-seq ys))
+               (return-from looks-like-block-map-p nil))
+             (when (loop for i from start below (ys-pos ys)
+                         thereis (b-break-p (char (ys-text ys) i)))
+               (return-from looks-like-block-map-p nil))))
           ((eql (ys-peek ys) #\{)
-           (ignore-errors (parse-flow-map ys)))
+           (let ((start (ys-pos ys)))
+             (unless (ignore-errors (parse-flow-map ys))
+               (return-from looks-like-block-map-p nil))
+             (when (loop for i from start below (ys-pos ys)
+                         thereis (b-break-p (char (ys-text ys) i)))
+               (return-from looks-like-block-map-p nil))))
           (t
            (loop
              (let ((c (ys-peek ys)))
@@ -811,7 +841,7 @@
     (unwind-protect
          (progn
            (s-l-comments ys)
-           (when (looks-like-explicit-key-p ys)
+           (when (looks-like-explicit-key-p ys t)
              (return-from looks-like-flow-pair-p t))
            (loop
              (let ((c (ys-peek ys)))
@@ -849,20 +879,32 @@
                   (ys-next ys))))))
       (setf (ys-pos ys) saved))))
 
+(defun colon-after-break-p (ys)
+  "True when `:` is the first non-white on its line (DK4H)."
+  (let ((text (ys-text ys))
+        (i (1- (ys-pos ys))))
+    (loop while (and (>= i 0) (s-white-p (char text i)))
+          do (decf i))
+    (or (minusp i) (b-break-p (char text i)))))
+
 (defun ns-s-flow-pair (ys &key (indent -1))
-  "[150] ns-s-implicit-yaml-key is FLOW-KEY (one-line). Explicit `?` is FLOW-IN (CT4Q)."
+  "[150] implicit pair. Multiline plain is allowed (8KB6); `:` after a break is not (DK4H)."
   (emit ys :mapping-start :flow-p t)
-  (if (looks-like-explicit-key-p ys)
+  (if (looks-like-explicit-key-p ys t)
       (progn
         (ys-next ys)
         (s-l-comments ys)
         (when (c-forbidden-p ys)
           (fail-parse ys "document marker in flow"))
-        (parse-node ys :flow t :indent indent :key :explicit))
-      (parse-node ys :flow t :indent indent :key :implicit))
+        (if (member (ys-peek ys) '(#\: #\, #\] #\}))
+            (emit-scalar ys "")
+            (parse-node ys :flow t :indent indent :key :explicit)))
+      (parse-node ys :flow t :indent indent))
   (s-l-comments ys)
   (unless (eql (ys-peek ys) #\:)
     (fail-parse ys "expected : in flow pair"))
+  (when (colon-after-break-p ys)
+    (fail-parse ys "implicit key must be on one line"))
   (ys-next ys)
   (s-l-comments ys)
   (if (member (ys-peek ys) '(#\, #\] #\}))
@@ -937,11 +979,13 @@
       (ys-next ys)
       (emit ys :mapping-end)
       (return))
-    (if (looks-like-explicit-key-p ys)
+    (if (looks-like-explicit-key-p ys t)
         (progn
           (ys-next ys)
           (s-l-comments ys)
-          (parse-node ys :flow t :indent indent :key :explicit)
+          (if (member (ys-peek ys) '(#\: #\, #\}))
+              (emit-scalar ys "")
+              (parse-node ys :flow t :indent indent :key :explicit))
           (s-l-comments ys)
           (if (eql (ys-peek ys) #\:)
               (progn
@@ -952,10 +996,14 @@
                     (parse-node ys :flow t :indent indent)))
               (emit-scalar ys "")))
         (progn
-          (parse-node ys :flow t :indent indent :key :implicit)
+          (if (and (eql (ys-peek ys) #\:) (colon-ends-plain-p ys t))
+              (emit-scalar ys "")
+              (parse-node ys :flow t :indent indent))
           (s-l-comments ys)
           (cond
             ((eql (ys-peek ys) #\:)
+             (when (colon-after-break-p ys)
+               (fail-parse ys "implicit key must be on one line"))
              (ys-next ys)
              (s-l-comments ys)
              (if (member (ys-peek ys) '(#\, #\}))
@@ -1006,12 +1054,8 @@
                   (parse-node ys :indent indent :in-seq t)
                   (emit-scalar ys "")))
              ((s-white-p (ys-peek ys))
-              (let ((tab (eql (ys-peek ys) #\Tab)))
-                (s-separate-in-line ys)
-                (when (and tab (or (looks-like-block-seq-p ys)
-                                   (looks-like-explicit-key-p ys)
-                                   (eql (ys-peek ys) #\:)))
-                  (fail-parse ys "tab used as indentation")))
+              (%tab-then-block-indicator ys)
+              (s-separate-in-line ys)
               (if (or (ys-eof-p ys) (b-break-p (ys-peek ys)) (eql (ys-peek ys) #\#))
                   (progn
                     (skip-comment ys)
@@ -1054,14 +1098,20 @@
              (and (= col indent) (looks-like-block-seq-p ys))))))
 
 (defun %tab-then-block-indicator (ys)
-  (when (eql (ys-peek ys) #\Tab)
-    (let ((saved (ys-pos ys)))
-      (s-separate-in-line ys)
-      (when (or (looks-like-block-seq-p ys)
-                (looks-like-explicit-key-p ys)
-                (eql (ys-peek ys) #\:))
-        (fail-parse ys "tab used as indentation"))
-      (setf (ys-pos ys) saved))))
+  "[63] s-indent is spaces. A tab in the separator before a block
+   indicator or implicit key is an error (Y79Y)."
+  (let ((saw-tab nil)
+        (saved (ys-pos ys)))
+    (loop while (s-white-p (ys-peek ys))
+          do (when (eql (ys-peek ys) #\Tab)
+               (setf saw-tab t))
+             (ys-next ys))
+    (when (and saw-tab (or (looks-like-block-seq-p ys)
+                           (looks-like-explicit-key-p ys)
+                           (looks-like-block-map-p ys)
+                           (eql (ys-peek ys) #\:)))
+      (fail-parse ys "tab used as indentation"))
+    (setf (ys-pos ys) saved)))
 
 (defun l+block-mapping (ys &key anchor tag)
   "[187] l+block-mapping(n)"
@@ -1164,7 +1214,8 @@
         (c-ns-properties ys :indent indent)
       (let ((broke (skip-to-node-content ys indent))
             (c (ys-peek ys)))
-        (when (and (or anchor tag) (eql c #\*))
+        (when (and (or anchor tag) (eql c #\*)
+                   (not (looks-like-block-map-p ys)))
           (fail-parse ys "alias node cannot have properties"))
         (when (and broke (or (eql c #\&) (eql c #\!))
                    (<= (ys-column ys) indent))
@@ -1172,6 +1223,8 @@
         (when (and (or anchor tag) (not broke) c
                    (not (s-white-p c))
                    (not (member c '(#\{ #\[ #\| #\> #\" #\' #\*)))
+                   (not (and flow (c-flow-indicator-p c)))
+                   (not (and (eql c #\:) (colon-ends-plain-p ys flow)))
                    (not (ns-plain-first-p ys flow))
                    (not (and (not flow) (or (looks-like-block-seq-p ys)
                                             (looks-like-block-map-p ys)))))
@@ -1190,6 +1243,10 @@
             ((and flow (c-forbidden-p ys))
              (fail-parse ys "document marker in flow"))
             ((or (null c)
+                 (and flow (c-flow-indicator-p c))
+                 (and (eql c #\:) (colon-ends-plain-p ys flow)
+                      (or flow (eq key :implicit) (eq key :explicit)
+                          (not (looks-like-block-map-p ys))))
                  (and (not flow)
                       (or (c-forbidden-p ys)
                           (< (ys-column ys) indent))))
