@@ -1,10 +1,13 @@
 (defsystem "yaml-protocol"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "CLOS YAML 1.2 event parser/composer; extends json-protocol (JSON ⊂ YAML); implements serdes-protocol :yaml"
   :author "egao1980"
   :license "MIT"
   :depends-on ("encoding-protocol" "json-protocol" "serdes-protocol")
-  :properties (:cl-repo (:ci (:with ("json-backend-jzon"))))
+  ;; Own GHCR repo. Without this, discover can put json-backend-jzon first and
+  ;; the owning-repo token 403s pushing that package.
+  :properties (:cl-repo (:provides ("yaml-protocol")
+                         :ci (:with ("json-backend-jzon"))))
   :serial t
   :pathname "src"
   :components ((:file "package")
