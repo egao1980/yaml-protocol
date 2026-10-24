@@ -10,7 +10,7 @@ jzon stays the RFC 8259 `:json` path — `json-protocol` does **not** depend on 
 
 | System | Role | version |
 |--------|------|---------|
-| `yaml-protocol` (`stack-yaml`) | YAML 1.2 events + compose + serdes `:yaml` | **0.2.0** |
+| `yaml-protocol` (`stack-yaml`) | YAML 1.2 events + compose + serdes `:yaml` | **0.2.1** |
 
 ```lisp
 (asdf:load-system "yaml-protocol")
