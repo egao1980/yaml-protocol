@@ -1,1 +1,3 @@
-tests/suite/** linguist-vendored
+# yaml-test-suite fixtures are byte-exact data: never convert line endings
+# (Windows autocrlf turned test.event into CRLF and failed every events case).
+tests/suite/** -text linguist-vendored
