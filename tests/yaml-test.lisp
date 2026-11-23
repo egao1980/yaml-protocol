@@ -126,6 +126,25 @@
       (ok (search "a: " s))
       (ok (eq :block *default-yaml-style*)))))
 
+(defun %lines-with-trailing-space (text)
+  "Lines of TEXT that end in a space or tab (yamllint trailing-spaces)."
+  (with-input-from-string (in text)
+    (loop for line = (read-line in nil)
+          while line
+          when (and (plusp (length line))
+                    (member (char line (1- (length line))) '(#\Space #\Tab)))
+            collect line)))
+
+(deftest block-encode-no-trailing-space-after-nested-key
+  "yaml-protocol#7: a key whose value is a nested mapping or sequence
+   is written as `key:` then a newline, with no space before it."
+  (ok (string= (format nil "langs:~%  - lisp~%  - ml~%name: Ada")
+               (string-right-trim '(#\Newline)
+                                  (encode (decode "{name: Ada, langs: [lisp, ml]}")))))
+  (let ((text (encode (decode (format nil "a:~%  b:~%    c: [1, 2]~%  d: x~%e: [[1], {f: 2}]~%")))))
+    (ok (null (%lines-with-trailing-space text))
+        (format nil "lines with trailing space: ~S" (%lines-with-trailing-space text)))))
+
 (deftest yaml-merge-alias
   (let ((v (decode (format nil "base: &b~%  a: 1~%  b: 2~%item:~%  <<: *b~%  c: 3~%"))))
     (let ((item (gethash "item" v)))
