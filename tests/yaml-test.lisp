@@ -145,6 +145,40 @@
     (ok (null (%lines-with-trailing-space text))
         (format nil "lines with trailing space: ~S" (%lines-with-trailing-space text)))))
 
+(deftest block-encode-key-line-edge-cases
+  "yaml-protocol#7 edges: scalars, empty containers and aliases stay on
+   the key's line after one space; a shared nested container puts its
+   anchor on the key's line; nothing ends in a space; all round-trip."
+  (let ((ht (make-hash-table :test #'equal)))
+    (setf (gethash "e" ht) (make-hash-table :test #'equal)
+          (gethash "l" ht) #()
+          (gethash "n" ht) :null
+          (gethash "s" ht) "")
+    (let ((text (encode ht)))
+      (ok (string= (format nil "e: {}~%l: []~%n: null~%s: \"\"")
+                   (string-right-trim '(#\Newline) text)))
+      (ok (null (%lines-with-trailing-space text)))))
+  (let* ((shared (decode "{x: 1, y: [2, 3]}"))
+         (ht (make-hash-table :test #'equal)))
+    (setf (gethash "a" ht) shared
+          (gethash "b" ht) shared)
+    (let ((text (encode ht)))
+      (ok (null (%lines-with-trailing-space text))
+          (format nil "lines with trailing space: ~S"
+                  (%lines-with-trailing-space text)))
+      (ok (search (format nil "a: &id1~%  x: 1") text) text)
+      (ok (search "b: *id1" text) text)
+      (let ((round (decode text)))
+        (ok (eq (gethash "a" round) (gethash "b" round)))
+        (ok (equalp #(2 3) (gethash "y" (gethash "a" round)))))))
+  (let ((text (encode (decode "{rows: [{k: 1, v: [a]}, {k: 2, v: {}}]}"))))
+    (ok (null (%lines-with-trailing-space text))
+        (format nil "lines with trailing space: ~S"
+                (%lines-with-trailing-space text)))
+    (ok (string= (format nil "rows:~%  - k: 1~%    v:~%      - a~%  - k: 2~%    v: {}")
+                 (string-right-trim '(#\Newline) text))
+        text)))
+
 (deftest yaml-merge-alias
   (let ((v (decode (format nil "base: &b~%  a: 1~%  b: 2~%item:~%  <<: *b~%  c: 3~%"))))
     (let ((item (gethash "item" v)))
