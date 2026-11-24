@@ -1,5 +1,5 @@
 (defsystem "yaml-protocol"
-  :version "0.2.1"
+  :version "0.2.2"
   :description "CLOS YAML 1.2 event parser/composer; extends json-protocol (JSON ⊂ YAML); implements serdes-protocol :yaml"
   :author "egao1980"
   :license "MIT"

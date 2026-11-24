@@ -10,7 +10,7 @@ jzon stays the RFC 8259 `:json` path — `json-protocol` does **not** depend on 
 
 | System | Role | version |
 |--------|------|---------|
-| `yaml-protocol` (`stack-yaml`) | YAML 1.2 events + compose + serdes `:yaml` | **0.2.1** |
+| `yaml-protocol` (`stack-yaml`) | YAML 1.2 events + compose + serdes `:yaml` | **0.2.2** |
 
 ```lisp
 (asdf:load-system "yaml-protocol")
@@ -51,6 +51,8 @@ Compose **always** builds this Lisp graph (same as json-protocol):
 Anchors are registered **before** a collection is filled, so `&a [1, *a]` and `&m {self: *m}` are cyclic graphs. Hash-tables and vectors (and cons) are references; `eq` is identity.
 
 **Encode (`:block`)** walks twice: count `eq` hits, assign `idN` to objects seen ≥2 times, then emit with a **visited set** — first time `&idN`, later `*idN`. `:style :json` has no aliases: a cycle (`graph-cyclic-p`, gray/visited set) is `yaml-encode-error`. Do not walk a composed value without a seen table.
+
+Block output has no trailing whitespace (yamllint `trailing-spaces` clean). A scalar, `{}`, `[]` or `*idN` goes on its key's line as `key: value`. A nested mapping or sequence goes below as `key:` + newline; a shared one keeps its anchor on the key's line (`key: &id1`).
 
 `:object-class` is optional and runs **after** compose, **once per document root**:
 

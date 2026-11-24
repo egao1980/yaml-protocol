@@ -85,6 +85,14 @@
   (or (not (%nonempty-container-p value))
       (and (%anchor-id value) (%already-emitted-p value))))
 
+(defun %value-on-key-line-p (value)
+  "T when a mapping VALUE starts on its key's line (`key: VALUE').
+Scalars, empty containers and aliases fit on the line.  A first-seen
+anchored container does too: `key: &idN' then %WRITE-ANCHOR breaks the
+line.  Any other nested container goes below as `key:' + newline."
+  (or (%emit-inline-p value)
+      (and (%anchor-id value) t)))
+
 (defun graph-cyclic-p (value &optional (visiting (make-hash-table :test #'eq)))
   "T if VALUE's object graph has a back-edge (EQ visited set)."
   (unless (%container-p value)
@@ -199,10 +207,14 @@
                       (if (%safe-plain-p ks)
                           (write-string ks stream)
                           (%emit-quoted ks stream)))
-                    (write-string ": " stream)
                     (let ((v (gethash k value)))
-                      (if (%emit-inline-p v)
-                          (emit-block v stream (+ indent 2) :first t)
+                      ;; yaml-protocol#7: the separating space belongs to a
+                      ;; value on the key's line, never before a line break.
+                      (write-char #\: stream)
+                      (if (%value-on-key-line-p v)
+                          (progn
+                            (write-char #\Space stream)
+                            (emit-block v stream (+ indent 2) :first t))
                           (progn
                             (write-char #\Newline stream)
                             (%indent stream (+ indent 2))
